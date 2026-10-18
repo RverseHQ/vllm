@@ -16,6 +16,7 @@ class RecoverSSMPostprocessMetadata:
     block_table: torch.Tensor
     num_computed_tokens: torch.Tensor
     block_size: int
+    running_state_columns: torch.Tensor | None = None
 
 
 class RecoverSSMMetadata(abc.ABC):

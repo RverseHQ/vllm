@@ -202,7 +202,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
-            (self.decode_cudagraph_max_bs, self.num_spec + 1),
+            (
+                self.decode_cudagraph_max_bs,
+                self.kv_cache_spec.num_speculative_blocks + 1,
+            ),
             dtype=torch.int32,
             device=device,
         )
@@ -446,7 +449,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 # Padded sequences trail the spec decodes, so slice them off
                 # rather than gather with the host mask (an H2D copy + a kernel).
                 spec_state_indices_tensor = block_table_tensor[
-                    :num_spec_decodes, : self.num_spec + 1
+                    :num_spec_decodes, : self.kv_cache_spec.num_speculative_blocks + 1
                 ]
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first
@@ -467,7 +470,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_token_indx = index[num_non_spec_tokens:]
 
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
+                    spec_sequence_masks_cpu,
+                    : self.kv_cache_spec.num_speculative_blocks + 1,
                 ]
                 non_spec_state_indices_tensor = block_table_tensor[
                     non_spec_sequence_masks_cpu, 0

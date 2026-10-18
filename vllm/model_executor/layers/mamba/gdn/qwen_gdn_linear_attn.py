@@ -7,7 +7,8 @@ import itertools
 import math
 import os
 from dataclasses import replace
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+from weakref import ReferenceType
 
 import torch
 from einops import rearrange
@@ -77,12 +78,24 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     direct_register_custom_op,
 )
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import (
     FLASHINFER_GDN_CHECKPOINT_ALIGNMENT,
     GDNAttentionMetadata,
 )
+from vllm.v1.attention.backends.gdn_recover_attn import (
+    GDNRecoverAttentionBackend,
+    GDNRecoverAttentionMetadata,
+    compact_gdn_conv,
+)
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.mamba.ops.gdn_recover import (
+        GdnRecoverBatch,
+        GdnRecoverBatchStorage,
+    )
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -512,6 +525,30 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+    gdn_recovery_binding: tuple[ReferenceType["GdnRecoverBatch"], int]
+    gdn_recovery_storage: "GdnRecoverBatchStorage"
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        if self.use_gdn_recovery:
+            batch_ref, index = self.gdn_recovery_binding
+            batch = batch_ref()
+            assert batch is not None, "GDN recovery builder must own live descriptors"
+            conv = (
+                self.kv_cache[0]
+                if is_conv_state_dim_first()
+                else self.kv_cache[0].transpose(-1, -2)
+            )
+            batch.bind_layer(
+                index,
+                payload=self.gdn_replay,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                state=self.kv_cache[1],
+                conv=conv,
+                history=self.conv_kernel_size - 1,
+            )
+
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -524,6 +561,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv_kernel_size,
             self.num_spec,
         )
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        if self.use_gdn_recovery:
+            return GDNRecoverAttentionBackend
+        return super().get_attn_backend()
 
     def __init__(
         self,
@@ -694,7 +736,49 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self.speculative_config is not None:
             logger.info_once("GDN spec decode kernel: %s", self.gdn_decode_kernel)
 
+        self.use_gdn_recovery = (
+            vllm_config.use_v2_model_runner
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+            and self.tp_size == 1
+            and vllm_config.cache_config.mamba_cache_mode == "align"
+            and 0 < self.num_spec <= MAX_FUSED_GDN_MTP_TOKENS - 2
+            and current_platform.is_cuda()
+            and self._fused_gdn_decode_unsupported_reason(vllm_config) is None
+            and self.get_state_dtype()[1] == torch.float32
+            and (
+                vllm_config.kv_transfer_config is None
+                or vllm_config.kv_transfer_config.kv_connector is None
+            )
+        )
         compilation_config = get_current_vllm_config().compilation_config
+        if self.use_gdn_recovery:
+            # Allocate before KV profiling; graph replay writes these same addresses.
+            device = current_platform.current_device()
+            from vllm.model_executor.layers.mamba.ops.gdn_recover import (
+                GdnRecoverBatchStorage,
+                allocate_payload,
+            )
+
+            self.gdn_replay = allocate_payload(
+                rows=vllm_config.scheduler_config.max_num_seqs,
+                max_tokens=self.num_spec + 1,
+                num_key_heads=self.num_k_heads,
+                num_value_heads=self.num_v_heads,
+                device=device,
+            )
+            storage = next(
+                (
+                    layer.gdn_recovery_storage
+                    for layer in compilation_config.static_forward_context.values()
+                    if isinstance(layer, QwenGatedDeltaNetAttention)
+                    and layer.use_gdn_recovery
+                ),
+                None,
+            )
+            self.gdn_recovery_storage = (
+                storage if storage is not None else GdnRecoverBatchStorage(device)
+            )
+
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
@@ -704,6 +788,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         spec = super().get_kv_cache_spec(vllm_config)
+        if self.use_gdn_recovery:
+            assert isinstance(spec, MambaSpec)
+            # Replay replaces only per-draft states, not prefill checkpoints.
+            spec = replace(spec, num_speculative_blocks=0)
         if not self._exports_checkpoints or not isinstance(spec, MambaSpec):
             return spec
         # FlashInfer emits states at one stride for the whole batch, the gcd of
@@ -1602,7 +1690,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                max_query_len=(
+                    self.num_spec + 1
+                    if self.use_gdn_recovery
+                    else spec_state_indices_tensor.size(-1)
+                ),
                 validate_data=False,
             )
 
@@ -1704,6 +1796,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            ssm_indices = spec_state_indices_tensor
+            source_selectors = num_accepted_tokens
+            if isinstance(attn_metadata, GDNRecoverAttentionMetadata):
+                self._save_gdn_replay(mixed_qkv_spec, a_spec, b_spec)
+                ssm_indices = attn_metadata.verify_indices[
+                    : attn_metadata.num_spec_decodes
+                ]
+                source_selectors = attn_metadata.source_selectors[
+                    : attn_metadata.num_spec_decodes
+                ]
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -1719,8 +1821,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         : attn_metadata.num_spec_decodes
                         + 1  # type: ignore[attr-defined]
                     ],
-                    ssm_state_indices=spec_state_indices_tensor,
-                    num_accepted_tokens=num_accepted_tokens,
+                    ssm_state_indices=ssm_indices,
+                    num_accepted_tokens=source_selectors,
                     use_qk_l2norm_in_kernel=True,
                 )
             )
@@ -2013,7 +2115,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_state_indices=state_indices[:num_requests, 0],
             num_accepted_tokens=num_accepted_tokens[:num_requests],
             query_start_loc=cu_seqlens[: num_requests + 1],
-            max_query_len=state_indices.size(1),
+            max_query_len=(
+                self.num_spec + 1 if self.use_gdn_recovery else state_indices.size(1)
+            ),
             validate_data=False,
         )
         self._forward_core_decode_spec_post_conv_fused_norm(
@@ -2042,6 +2146,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert num_accepted_tokens is not None
 
         num_requests = attn_metadata.num_spec_decodes
+        if isinstance(attn_metadata, GDNRecoverAttentionMetadata):
+            self._save_gdn_replay(mixed_qkv, a, b)
+            state_indices = attn_metadata.verify_indices
+            num_accepted_tokens = attn_metadata.source_selectors
         ops.fused_gdn_decode_post_conv_mtp(
             mixed_qkv=mixed_qkv,
             a=a,
@@ -2105,8 +2213,80 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.num_v_heads % self.num_k_heads == 0
             and self.num_v_heads // self.num_k_heads in (1, 2, 3, 4, 8)
             and state_indices is not None
-            and state_indices.size(1) <= MAX_FUSED_GDN_MTP_TOKENS
+            and (self.num_spec + 1 if self.use_gdn_recovery else state_indices.size(1))
+            <= MAX_FUSED_GDN_MTP_TOKENS
             and hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp")
+        )
+
+    def _save_gdn_replay(
+        self, mixed_qkv: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+    ) -> None:
+        n = mixed_qkv.shape[0]
+        assert n <= self.gdn_replay.mixed_qkv.shape[0], (
+            "GDN replay token capacity exceeded"
+        )
+        self.gdn_replay.mixed_qkv[:n].copy_(mixed_qkv)
+        self.gdn_replay.a[:n].copy_(a)
+        self.gdn_replay.b[:n].copy_(b)
+
+    def uses_native_gdn_recovery(self, metadata: GDNRecoverAttentionMetadata) -> bool:
+        # Match the original producer route, including mixed-prefill exclusion.
+        return (
+            self.enable_fused_gdn_spec_decode
+            and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
+            and self._can_use_fused_gdn_mtp_decode(metadata)
+            and metadata.num_prefills == 0
+        )
+
+    def commit_gdn_recovery(
+        self, metadata: GDNRecoverAttentionMetadata, *, compact_conv: bool = True
+    ) -> None:
+        from vllm.model_executor.layers.mamba.ops.gdn_recover import (
+            recover_native,
+            recover_triton,
+        )
+
+        n = metadata.num_spec_decodes
+        tokens = metadata.num_spec_decode_tokens
+        assert metadata.spec_query_start_loc is not None
+        native = self.uses_native_gdn_recovery(metadata)
+        if native:
+            recover_native(
+                mixed_qkv=self.gdn_replay.mixed_qkv[:tokens],
+                a=self.gdn_replay.a[:tokens],
+                b=self.gdn_replay.b[:tokens],
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                state_indices=metadata.replay_indices[:n],
+                cu_seqlens=metadata.spec_query_start_loc[: n + 1],
+                source_selectors=metadata.source_selectors[:n],
+                state_pool=self.kv_cache[1],
+                num_key_heads=self.num_k_heads,
+                num_value_heads=self.num_v_heads,
+            )
+        else:
+            recover_triton(
+                mixed_qkv=self.gdn_replay.mixed_qkv[:tokens],
+                a=self.gdn_replay.a[:tokens],
+                b=self.gdn_replay.b[:tokens],
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                state_indices=metadata.replay_indices[:n],
+                cu_seqlens=metadata.spec_query_start_loc[: n + 1],
+                source_selectors=metadata.source_selectors[:n],
+                state_pool=self.kv_cache[1],
+                num_key_heads=self.num_k_heads,
+                num_value_heads=self.num_v_heads,
+            )
+        if not compact_conv:
+            return
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        compact_gdn_conv(
+            conv_state, metadata.plan[:n], history_size=self.conv_kernel_size - 1
         )
 
     def _rms_norm_gated_cuda(

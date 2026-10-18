@@ -60,6 +60,7 @@ class RecoverSSMState:
                 num_sampled,
                 postprocess_meta.request_indices,
                 postprocess_meta.num_computed_tokens,
+                postprocess_meta.running_state_columns,
                 state_indices,
                 num_accepted_tokens,
                 MAMBA_BLOCK_SIZE=postprocess_meta.block_size,
@@ -68,7 +69,10 @@ class RecoverSSMState:
 
 
 @triton.heuristics(
-    {"HAS_REQUEST_INDICES": lambda args: args["request_indices_ptr"] is not None}
+    {
+        "HAS_REQUEST_INDICES": lambda args: args["request_indices_ptr"] is not None,
+        "HAS_RUNNING_COLUMNS": lambda args: args["running_columns_ptr"] is not None,
+    }
 )
 @triton.jit
 def _postprocess_recoverssm_align_kernel(
@@ -76,9 +80,11 @@ def _postprocess_recoverssm_align_kernel(
     num_sampled_ptr,
     request_indices_ptr,
     num_computed_ptr,
+    running_columns_ptr,
     state_idx_ptr,
     num_accepted_ptr,
     HAS_REQUEST_INDICES: tl.constexpr,
+    HAS_RUNNING_COLUMNS: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
     BLOCK_TABLE_WIDTH: tl.constexpr,
 ):
@@ -91,11 +97,14 @@ def _postprocess_recoverssm_align_kernel(
         return
     num_sampled = tl.load(num_sampled_ptr + batch_idx)
     num_computed = tl.load(num_computed_ptr + batch_idx)
-    tl.store(
-        state_idx_ptr + req_state_idx,
-        tl.minimum(
+    if HAS_RUNNING_COLUMNS:
+        running_col = tl.load(running_columns_ptr + spec_idx)
+        if running_col < 0:
+            return
+    else:
+        running_col = tl.minimum(
             tl.maximum(num_computed + num_sampled - 1, 0) // MAMBA_BLOCK_SIZE,
             BLOCK_TABLE_WIDTH - 1,
-        ),
-    )
+        )
+    tl.store(state_idx_ptr + req_state_idx, running_col)
     tl.store(num_accepted_ptr + req_state_idx, 1)

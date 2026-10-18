@@ -1599,6 +1599,7 @@ if _build_custom_ops():
 package_data = {
     "vllm": [
         "py.typed",
+        "model_executor/layers/mamba/ops/gdn_recover_native.cu",
         "libs/*.so*",
         "model_executor/layers/fused_moe/configs/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",
