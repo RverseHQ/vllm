@@ -909,11 +909,8 @@ def prepare_inputs_to_capture(
 # CUDA graph memory profiling
 # ---------------------------------------------------------------------------
 
-# Number of FULL graphs captured during profiling; the total FULL capture
-# cost is extrapolated from this sample to avoid a second full capture.
-_FULL_GRAPH_PROFILING_SAMPLES = 2
-# Floor for the extrapolated per-graph cost (driver overhead per graph).
-_MIN_PER_GRAPH_BYTES = 1 << 20
+# Measure every FULL graph in the shared throwaway pool before sizing the KV cache.
+_FULL_GRAPH_PROFILING_SAMPLES = None
 
 
 @torch.inference_mode()
@@ -925,9 +922,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     graph capture. Bootstraps a minimal KV cache, runs ``capture_model()``
     once, then releases everything so the real init/capture path starts clean.
 
-    FULL graphs bake in KV cache pointers, so only the largest few are
-    captured (into a throwaway pool) and their total cost is extrapolated.
-    PIECEWISE, encoder and speculator graphs are measured in full. All
+    FULL graphs bake in KV cache pointers and are measured in full in a
+    throwaway pool, as are PIECEWISE, encoder and speculator graphs. All
     profiling captures are discarded afterwards: replaying graphs recorded
     against the throwaway profiling state is unsafe (e.g. inductor graph
     partition reclaims the storages of earlier cudagraph recordings once the
@@ -994,11 +990,9 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             with capture_outside_cumem_pool():
                 measured = int(runner.capture_model(profile_only=True))
 
-            # The measured delta covers PIECEWISE, encoder and speculator graphs
-            # plus the sampled FULL graphs; swap the sampled FULL cost for the
-            # extrapolated total. FULL and PIECEWISE share one pool here just as
-            # they share the global pool at runtime, so the overlap is not
-            # double-counted.
+            # FULL and PIECEWISE share one pool here just as they share the
+            # global pool at runtime. Validate that every FULL graph was measured
+            # without double-counting its contribution to the total delta.
             num_full_graphs = len(manager._capture_descs.get(CUDAGraphMode.FULL, []))
             full_estimate = _extrapolate_full_graph_memory(mem_samples, num_full_graphs)
             return max(measured - sum(mem_samples) + full_estimate, 0)
@@ -1024,14 +1018,23 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
 
 
 def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) -> int:
-    """Extrapolate the total FULL capture cost from samples of the largest
-    graphs. The first capture allocates the pool baseline; later graphs mostly
-    reuse it, so the second sample is taken as the per-graph cost."""
-    if not mem_samples:
-        return 0
-    first_capture = mem_samples[0]
-    per_graph = max(mem_samples[1], _MIN_PER_GRAPH_BYTES) if len(mem_samples) > 1 else 0
-    return first_capture + (total_graphs - 1) * per_graph
+    """Return the measured cost of all FULL captures in the shared profiling pool."""
+    if len(mem_samples) != total_graphs:
+        raise RuntimeError(
+            f"Expected {total_graphs} measured FULL graph captures, "
+            f"got {len(mem_samples)}"
+        )
+    segments = torch.cuda.memory._snapshot()["segments"]
+    large = [segment for segment in segments if segment["segment_type"] == "large"]
+    graph = [segment for segment in large if segment["segment_pool_id"] != (0, 0)]
+    logger.info(
+        "Allocator segments: large=%d expandable_large=%d graph=%d expandable_graph=%d",
+        len(large),
+        sum(segment["is_expandable"] for segment in large),
+        len(graph),
+        sum(segment["is_expandable"] for segment in graph),
+    )
+    return sum(mem_samples)
 
 
 def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
