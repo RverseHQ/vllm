@@ -1,0 +1,63 @@
+diff --git a/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp b/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+index 6e0d8b7..efc5ef1 100644
+--- a/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
++++ b/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+@@ -102,13 +102,22 @@ struct CollectiveMainloopFwdSm90 {
+         AtomLayoutQK,
+         Layout<Shape<_1, Int<kHeadDimV / 256>, _1>>
+     >;
++#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
++    static constexpr bool SplitFP8PV = Is_FP8 && !IntraWGOverlap && kHeadDimV == 256;
++#else
++    static constexpr bool SplitFP8PV = false;
++#endif
++    // Keep the running FP32 output live, but flush only half its columns
++    // at a time so the additional tile accumulator fits the register budget.
++    using TileShape_MNK_PV_Atom = Shape<decltype(get<0>(TileShape_MNK_PV{})),
++        Int<SplitFP8PV ? kHeadDimV / 2 : kHeadDimV>, decltype(get<2>(TileShape_MNK_PV{}))>;
+     using TiledMmaPV = decltype(cute::make_tiled_mma(
+         std::conditional_t<
+             !MmaPV_is_RS,
+             decltype(cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
+-                     TileShape_MNK_PV, GMMA::Major::K, MmaMajorV>()),
++                     TileShape_MNK_PV_Atom, GMMA::Major::K, MmaMajorV>()),
+             decltype(cute::GMMA::rs_op_selector<Element, Element, ElementAccum,
+-                     TileShape_MNK_PV, GMMA::Major::K, MmaMajorV>())
++                     TileShape_MNK_PV_Atom, GMMA::Major::K, MmaMajorV>())
+         >{},
+         AtomLayoutPV{}));
+     using TiledMmaQV = decltype(cute::make_tiled_mma(
+@@ -1382,14 +1391,31 @@ struct CollectiveMainloopFwdSm90 {
+                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
+                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
+                 warp_scheduler_barrier_sync();
+-                if constexpr (!MmaPV_use_RS_WG1) {
++                if constexpr (SplitFP8PV && !Is_first_iter) {
++                    static constexpr int MMA_N = decltype(size<2>(tOrO))::value;
++                    static_assert(!SplitFP8PV || MMA_N == 2);
++                    Tensor tOrV_stage = tOrV(_, _, _, smem_pipe_read.index());
++                    auto accumulate_slice = [&](auto n_slice) {
++                        Tensor output_slice = cute::logical_divide(tOrO, Shape<Underscore, Underscore, Int<MMA_N>>{})(_, _, make_coord(n_slice, _));
++                        Tensor value_slice = cute::logical_divide(tOrV_stage, Shape<Underscore, Int<MMA_N>>{})(_, make_coord(n_slice, _), _);
++                        auto partial = make_fragment_like(output_slice);
++                        flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_pv, tOrP, value_slice, partial);
++                        warpgroup_wait<0>();
++                        #pragma unroll
++                        for (int i = 0; i < size(output_slice); ++i) {
++                            output_slice(i) = output_slice(i) + partial(i);
++                        }
++                    };
++                    accumulate_slice(Int<0>{});
++                    accumulate_slice(Int<1>{});
++                } else if constexpr (!MmaPV_use_RS_WG1) {
+                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                 } else {
+                     TiledMmaPV_RS tiled_mma_pv_rs;
+                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                 }
+                 if constexpr (!MmaPV_is_RS && MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
+-                warpgroup_wait<0>();
++                if constexpr (!SplitFP8PV || Is_first_iter) { warpgroup_wait<0>(); }
+                 pipeline_v.consumer_release(smem_pipe_read);  // release V
+             };
+ 

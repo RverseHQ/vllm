@@ -4,6 +4,8 @@
 # ruff: noqa: E501
 
 
+import os
+
 import torch
 
 # isort: off
@@ -29,9 +31,20 @@ except ImportError as e:
     FA3_AVAILABLE = False
 
 
-try:
-    import os
+_FP8_TWO_LEVEL_FWD = None
+_fp8_two_level_library = os.environ.get("QWEN_MAIN237_FA3_LIBRARY")
+if _fp8_two_level_library:
+    torch.ops.load_library(_fp8_two_level_library)
+    _FP8_TWO_LEVEL_FWD = torch.ops._qwen_main237_fa3_C.fwd
 
+_FP8_Q4_FWD = None
+_fp8_q4_library = os.environ.get("QWEN_MAIN237_FA3_Q4_LIBRARY")
+if _fp8_q4_library:
+    torch.ops.load_library(_fp8_q4_library)
+    _FP8_Q4_FWD = torch.ops._qwen_q4_m64_C.fwd
+
+
+try:
     _cute_interface_path = os.path.join(
         os.path.dirname(__file__), "cute", "interface.py"
     )
@@ -385,7 +398,39 @@ def flash_attn_varlen_func(
             raise NotImplementedError("FA3 does not support mask_mod")
         if aux_tensors is not None:
             raise NotImplementedError("FA3 does not support aux_tensors")
-        out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
+        fwd = torch.ops._vllm_fa3_C.fwd
+        if (
+            _FP8_TWO_LEVEL_FWD is not None
+            and q.is_cuda
+            and q.ndim == 3
+            and k.ndim in (3, 4)
+            and v.ndim == k.ndim
+            and q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+            and q.shape[-2:] == (24, 256)
+            and k.shape[-2:] == v.shape[-2:] == (4, 256)
+            and q_v is None
+            and torch.cuda.get_device_capability(q.device) == (9, 0)
+        ):
+            fwd = _FP8_TWO_LEVEL_FWD
+            # Fixed-split graphs capture max_model_len, then update seqused_k.
+            if (
+                _FP8_Q4_FWD is not None
+                and max_seqlen_q == 4
+                and (num_splits > 1 or (num_splits == 0 and max_seqlen_k >= 32768))
+                and causal
+                and real_window_size == (-1, -1)
+                and softcap == 0
+                and k.ndim == 4
+                and k.shape[1] == 1600
+                and k.stride() == v.stride() == (3276800, 2048, 512, 1)
+                and block_table is not None
+                and seqused_k is not None
+                and cu_seqlens_k is None
+                and s_aux is None
+                and cp_world_size == 1
+            ):
+                fwd = _FP8_Q4_FWD
+        out, softmax_lse, _, _ = fwd(
             q,
             k,
             v,
