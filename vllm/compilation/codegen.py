@@ -192,10 +192,14 @@ def compile_execution_fn(
         },
         payload_fn=lambda: code,
     )
-    namespace: dict[str, Any] = {}
+    from vllm.compilation import boxed_piecewise
+
+    code, rewritten = boxed_piecewise.rewrite(code)
+    namespace: dict[str, Any] = {boxed_piecewise.CALL: boxed_piecewise.call_boxed}
     if consts is not None:
         namespace["__vllm_consts__"] = consts
     exec(code, namespace)  # noqa: S102
+    boxed_piecewise.logger.info("Boxed %d piecewise submodule calls", rewritten)
     fn = namespace["execution_fn"]
     # Using .get() is intentional here because only piecewise backend will
     # be stored in submod_callables. The other submodules are inlined and
