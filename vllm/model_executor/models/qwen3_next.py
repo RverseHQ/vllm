@@ -18,6 +18,9 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+    FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
+)
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -27,7 +30,10 @@ from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
     resolve_layer_fused_shared_expert,
 )
-from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
+from vllm.model_executor.layers.fused_qk_norm_rope import (
+    fused_qk_rmsnorm_rope_gate,
+    fused_qk_rmsnorm_rope_gate_out,
+)
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3NextRMSNorm,
 )
@@ -82,6 +88,105 @@ from .utils import (
 )
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
+
+
+@torch.library.custom_op("vllm::chunked_qkv_norm_rope_gate", mutates_args=())
+def chunked_qkv_norm_rope_gate(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    norm_beta: float,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    mrope_section: list[int] | None,
+    group_size: int,
+    use_e8m0: bool,
+    chunk_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FP8 QKV projection + fused QK-RMSNorm/RoPE/gate split, chunked by rows.
+
+    Each balanced row chunk runs the production dynamic FP8 GEMM, then one fused
+    launch writes its rows of the final q/k/v/gate buffers, so only one chunk of
+    packed qkv exists at a time. Up to ``chunk_tokens`` rows this is a single
+    GEMM + single fused launch, like the unchunked path.
+    """
+    rows = x.shape[0]
+    q_size = num_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    q = torch.empty((rows, q_size), dtype=x.dtype, device=x.device)
+    k = torch.empty((rows, kv_size), dtype=x.dtype, device=x.device)
+    v = torch.empty((rows, kv_size), dtype=x.dtype, device=x.device)
+    gate = torch.empty((rows, q_size), dtype=x.dtype, device=x.device)
+    count = max(1, (rows + chunk_tokens - 1) // chunk_tokens)
+    base, extra = divmod(rows, count)
+    start = 0
+    for index in range(count):
+        end = start + base + (index < extra)
+        qkv = torch.ops.vllm.dynamic_flashinfer_deepgemm_blockscale_gemm(
+            x[start:end], weight, weight_scale, group_size, use_e8m0
+        )
+        q_gate, k_in, v_in = qkv.split([q_size * 2, kv_size, kv_size], dim=-1)
+        fused_qk_rmsnorm_rope_gate_out(
+            q_gate,
+            k_in,
+            v_in,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions[..., start:end],
+            eps,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            q[start:end],
+            k[start:end],
+            v[start:end],
+            gate[start:end],
+            mrope_section=mrope_section,
+            norm_beta=norm_beta,
+        )
+        del qkv, q_gate, k_in, v_in
+        start = end
+    return q, k, v, gate
+
+
+@chunked_qkv_norm_rope_gate.register_fake
+def _chunked_qkv_norm_rope_gate_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    norm_beta: float,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    mrope_section: list[int] | None,
+    group_size: int,
+    use_e8m0: bool,
+    chunk_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows = x.shape[0]
+    q_size = num_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    return (
+        x.new_empty((rows, q_size)),
+        x.new_empty((rows, kv_size)),
+        x.new_empty((rows, kv_size)),
+        x.new_empty((rows, q_size)),
+    )
 
 
 def _should_use_sequence_parallel(vllm_config: VllmConfig) -> bool:
@@ -455,13 +560,56 @@ class Qwen3NextAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
+    def _chunked_qkv_gate(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kernel: FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """FP8 qkv_proj + fused norm/RoPE/gate written chunk by chunk.
+
+        Same GEMM op, BF16 qkv rounding and fused kernel arguments as
+        ``qkv_proj`` + ``_project_qkv_gate``; only the packed qkv lifetime and
+        the (contiguous) v layout differ. Balanced 4096-row chunks keep every
+        split GEMM above 2048 rows, on the DeepGEMM branch.
+        """
+        if positions.ndim == 2 and not getattr(self.rotary_emb, "mrope_section", None):
+            positions = positions[0]
+        return chunked_qkv_norm_rope_gate(
+            hidden_states.view(-1, hidden_states.shape[-1]),
+            self.qkv_proj.weight,
+            self.qkv_proj.weight_scale_inv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            self.q_norm.variance_epsilon,
+            1.0,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_emb.rotary_dim,
+            (list(self.rotary_emb.mrope_section) if positions.ndim == 2 else None),
+            kernel.weight_group_shape.col,
+            kernel.fallback.use_deep_gemm_e8m0,
+            4096,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        kernel = getattr(self.qkv_proj.quant_method, "fp8_linear", None)
+        if (
+            self.use_fused_qk_norm_rope_gate
+            and isinstance(kernel, FlashInferFp8DeepGEMMDynamicBlockScaledKernel)
+            and not self.qkv_proj.has_bias
+        ):
+            q, k, v, gate = self._chunked_qkv_gate(positions, hidden_states, kernel)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v, gate = self._project_qkv_gate(qkv, positions)
         attn_output = self.attn(q, k, v)
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)
