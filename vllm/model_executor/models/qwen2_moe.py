@@ -38,6 +38,9 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+    FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
+)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -53,6 +56,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    silu_mul_group_quant_fp8_e8m0_colmajor,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -71,6 +77,56 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+# Balanced chunks keep the down projection on the DeepGEMM branch.
+CHUNK_TOKENS = 2048
+
+
+@torch.library.custom_op("vllm::chunked_mlp", mutates_args=())
+def chunked_mlp(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+    gate_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    group_size: int,
+    use_e8m0: bool,
+    chunk_tokens: int,
+) -> torch.Tensor:
+    rows = x.shape[0]
+    count = (rows + chunk_tokens - 1) // chunk_tokens
+    base, extra = divmod(rows, count)
+    output = torch.empty((rows, down_weight.shape[0]), dtype=x.dtype, device=x.device)
+    start = 0
+    for index in range(count):
+        end = start + base + (index < extra)
+        gate_up = torch.ops.vllm.dynamic_flashinfer_deepgemm_blockscale_gemm(
+            x[start:end], gate_weight, gate_scale, group_size, use_e8m0
+        )
+        hidden, hidden_scale = silu_mul_group_quant_fp8_e8m0_colmajor(gate_up)
+        del gate_up
+        torch.ops.vllm.fp8_gemm_nt_op(
+            hidden, hidden_scale, down_weight, down_scale, output[start:end], use_e8m0
+        )
+        del hidden, hidden_scale
+        start = end
+    return output
+
+
+@chunked_mlp.register_fake
+def _chunked_mlp_fake(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+    gate_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    group_size: int,
+    use_e8m0: bool,
+    chunk_tokens: int,
+) -> torch.Tensor:
+    return torch.empty(
+        (x.shape[0], down_weight.shape[0]), dtype=x.dtype, device=x.device
+    )
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -112,7 +168,53 @@ class Qwen2MoeMLP(nn.Module):
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            not self.gate_up_proj.prefix.startswith(
+                ("language_model.model.layers.", "mtp.layers.")
+            )
+            or self.expert_gate is not None
+            or self.gate_up_proj.tp_size != 1
+            or self.down_proj.tp_size != 1
+        ):
+            return self._forward_unchunked(x)
+        gate_method = self.gate_up_proj.quant_method
+        down_method = self.down_proj.quant_method
+        gate_kernel = getattr(gate_method, "fp8_linear", None)
+        down_kernel = getattr(down_method, "fp8_linear", None)
+        if not (
+            isinstance(gate_kernel, FlashInferFp8DeepGEMMDynamicBlockScaledKernel)
+            and isinstance(down_kernel, FlashInferFp8DeepGEMMDynamicBlockScaledKernel)
+        ):
+            return self._forward_unchunked(x)
+        group_size = gate_kernel.weight_group_shape.col
+        use_e8m0 = gate_kernel.fallback.use_deep_gemm_e8m0
+        if (
+            group_size != 128
+            or down_kernel.weight_group_shape.col != 128
+            or not use_e8m0
+            or not down_kernel.fallback.use_deep_gemm_e8m0
+        ):
+            raise RuntimeError("Fused down projection expects group128 E8M0 FP8 scales")
+
+        def large(batch: torch.Tensor) -> torch.Tensor:
+            return chunked_mlp(
+                batch,
+                self.gate_up_proj.weight,
+                self.gate_up_proj.weight_scale_inv,
+                self.down_proj.weight,
+                self.down_proj.weight_scale_inv,
+                group_size,
+                use_e8m0,
+                CHUNK_TOKENS,
+            )
+
+        def small(batch: torch.Tensor) -> torch.Tensor:
+            return self._forward_unchunked(batch)
+
+        return torch.cond(x.shape[0] > CHUNK_TOKENS, large, small, (x,))
+
+    def _forward_unchunked(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)

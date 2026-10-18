@@ -28,7 +28,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.deep_gemm import (
     get_tma_aligned_size,
     is_deep_gemm_e8m0_used,
@@ -627,6 +627,94 @@ def _per_token_group_quant_fp8_colmajor(
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
+
+
+@triton.jit
+def _silu_mul_group_quant_fp8_e8m0_colmajor(
+    gate_up,
+    out,
+    scales,
+    rows,
+    columns,
+    gate_up_stride,
+    scale_stride,
+    eps: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    row_ids = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
+    group = tl.program_id(1).to(tl.int64)
+    column_ids = group * GROUP + tl.arange(0, GROUP)
+    live = row_ids < rows
+    offsets = row_ids[:, None] * gate_up_stride + column_ids[None, :]
+    gate = tl.load(gate_up + offsets, live[:, None], other=0).to(tl.float32)
+    up = tl.load(gate_up + offsets + columns, live[:, None], other=0).to(tl.float32)
+    # Inductor's SiLU decomposition x / (1 + exp(-x)) fused with the multiply in
+    # FP32, rounded to BF16 once where the compiled graph stores its hidden tensor.
+    hidden = gate / (1.0 + tldevice.exp(-gate)) * up
+    values = hidden.to(gate_up.dtype.element_ty).to(tl.float32)
+    # Same values and scales as the CUDA per_token_group_quant_8bit_register_kernel
+    # behind per_token_group_quant_fp8: fmaxf NaN skipping, separate UE8M0 floor,
+    # and division by a power-of-two scale equals its exact reciprocal multiply.
+    absolute = tl.where(values == values, tl.abs(values), 0.0)
+    maximum = tl.maximum(tl.max(absolute, axis=1), eps)
+    raw = tl.maximum(tl.div_rn(maximum, 448.0), 1.0e-10)
+    # Match the native register kernel's integer UE8M0 rounding.
+    bits = raw.to(tl.uint32, bitcast=True)
+    exponent = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    scale = ((exponent + (mantissa != 0).to(tl.uint32)) << 23).to(
+        tl.float32, bitcast=True
+    )
+    quantized = values / scale[:, None]
+    quantized = tl.where(
+        quantized == quantized,
+        tl.minimum(tl.maximum(quantized, -448.0), 448.0),
+        -448.0,
+    )
+    tl.store(
+        out + row_ids[:, None] * columns + column_ids[None, :],
+        quantized.to(out.dtype.element_ty),
+        live[:, None],
+    )
+    tl.store(scales + group * scale_stride + row_ids, scale, live)
+
+
+def silu_mul_group_quant_fp8_e8m0_colmajor(
+    gate_up: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize SiLU(gate) * up without materializing the BF16 product.
+
+    Matches the compiled `F.silu(gate) * up` followed by SM90
+    `per_token_group_quant_fp8(group_size=128, column_major_scales=True,
+    use_ue8m0=True)`: FP8 E4M3 values and FP32 power-of-two scales with
+    strides (1, rows). Any row count is accepted.
+    """
+    group = 128
+    rows, width = gate_up.shape
+    columns = width // 2
+    assert gate_up.dtype == torch.bfloat16 and gate_up.stride(1) == 1
+    assert width == 2 * columns and columns % group == 0
+    out = torch.empty((rows, columns), dtype=torch.float8_e4m3fn, device=gate_up.device)
+    scales = torch.empty(
+        (columns // group, rows), dtype=torch.float32, device=gate_up.device
+    ).permute(1, 0)
+    block_m = 16
+    grid = (triton.cdiv(rows, block_m), columns // group)
+    _silu_mul_group_quant_fp8_e8m0_colmajor[grid](
+        gate_up,
+        out,
+        scales,
+        rows,
+        columns,
+        gate_up.stride(0),
+        scales.stride(1),
+        1e-10,
+        GROUP=group,
+        BLOCK_M=block_m,
+        num_warps=4,
+    )
+    return out, scales
 
 
 def per_token_group_quant_fp8(
