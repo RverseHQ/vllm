@@ -71,7 +71,12 @@ def _trimmed_verify_batch(builder: KimiK3ROCmKDAMetadataBuilder):
     )
     accepted = torch.ones(2, dtype=torch.int32, device=DEVICE)
     num_decode_draft_tokens_cpu = torch.tensor([NUM_SPEC, NUM_SPEC], dtype=torch.int32)
-    return builder.build(0, common, accepted, num_decode_draft_tokens_cpu)
+    return builder.build(
+        0,
+        common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+    )
 
 
 def test_adaptive_verification_plans_from_device_offsets():

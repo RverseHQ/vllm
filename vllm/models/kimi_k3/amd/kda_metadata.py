@@ -113,20 +113,21 @@ class KimiK3ROCmKDAMetadataBuilder(GDNAttentionMetadataBuilder):
             return None
         return max_decode_query_len(vllm_config)
 
-    def build(  # type: ignore[override]
+    def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        *,
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
-        fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         attn_metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
-            num_accepted_tokens,
-            num_decode_draft_tokens_cpu,
-            fast_build,
+            num_accepted_tokens=num_accepted_tokens,
+            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            fast_build=fast_build,
         )
         if (
             attn_metadata.uniform_spec_sequence_length is not None

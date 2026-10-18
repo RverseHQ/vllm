@@ -820,8 +820,8 @@ def test_cudagraph_capture_metadata_avoids_device_to_host_copy(
     reference = builder.build(
         0,
         common_attn_metadata,
-        num_accepted_tokens,
-        (num_accepted_tokens - 1).cpu(),
+        num_accepted_tokens=num_accepted_tokens,
+        num_decode_draft_tokens_cpu=(num_accepted_tokens - 1).cpu(),
     )
     assert actual.num_spec_decodes == batch.batch_size
     assert actual.num_decodes == 0

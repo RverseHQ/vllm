@@ -355,13 +355,14 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         self.recoverssm_context = context
         return context
 
-    def build(  # type: ignore[override]
+    def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        *,
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
-        fast_build: bool = False,
     ) -> KimiK3KDAMetadata:
         m = common_attn_metadata
         query_start_loc = m.query_start_loc
