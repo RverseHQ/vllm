@@ -528,6 +528,36 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             self.language_model.make_empty_intermediate_tensors
         )
 
+    def process_weights_after_loading(self) -> None:
+        from vllm.model_executor.offloader.uva import UVAOffloader
+
+        embedding = self.language_model.model.embed_tokens
+        lm_head = self.language_model.lm_head
+        if (
+            embedding.weight.untyped_storage().data_ptr()
+            == lm_head.weight.untyped_storage().data_ptr()
+        ):
+            raise RuntimeError("Embedding UVA requires an untied GPU lm_head")
+        embedding_offloader = UVAOffloader(
+            cpu_offload_max_bytes=embedding.weight.nbytes,
+            cpu_offload_params={"embed_tokens"},
+        )
+        if not embedding_offloader.pin_memory or not embedding_offloader.uva_offloading:
+            raise RuntimeError("Embedding offload requires pinned-memory UVA")
+        embedding_offloader.wrap_modules(
+            (layer for layer in (embedding,)), prefix="embed_tokens"
+        )
+
+        visual_offloader = UVAOffloader(
+            cpu_offload_max_bytes=sum(p.nbytes for p in self.visual.parameters()),
+            cpu_offload_params={"visual"},
+        )
+        if not visual_offloader.pin_memory or not visual_offloader.uva_offloading:
+            raise RuntimeError("Visual offload requires pinned-memory UVA")
+        visual_offloader.wrap_modules(
+            (layer for layer in (self.visual,)), prefix="visual"
+        )
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
