@@ -491,6 +491,21 @@ class Worker(WorkerBase):
             )
             self.device = torch.device(f"cuda:{visible_device_index}")
             torch.accelerator.set_device_index(self.device)
+            kv_transfer = self.vllm_config.kv_transfer_config
+            if (
+                current_platform.is_cuda()
+                and parallel_config.tensor_parallel_size == 1
+                and parallel_config.data_parallel_size == 1
+                and parallel_config.pipeline_parallel_size == 1
+                and not self.model_config.enable_cumem_allocator
+                and (kv_transfer is None or kv_transfer.kv_connector is None)
+                and not os.environ.get("PYTORCH_ALLOC_CONF")
+                and not os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+            ):
+                torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
+                logger.info_once(
+                    "Using expandable CUDA segments for local single-worker inference."
+                )
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
