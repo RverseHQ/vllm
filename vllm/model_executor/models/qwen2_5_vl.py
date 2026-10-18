@@ -402,6 +402,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         )
 
         self.apply_rotary_emb = ApplyRotaryEmb(enforce_enable=True)
+        self._use_packed_rope = current_platform.is_cuda()
 
     def forward(
         self,
@@ -424,7 +425,21 @@ class Qwen2_5_VisionAttention(nn.Module):
             head=self.num_attention_heads_per_partition,
         )
 
-        if rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
+        if (
+            rotary_pos_emb_cos is not None
+            and rotary_pos_emb_sin is not None
+            and self._use_packed_rope
+        ):
+            from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb_qkv_
+
+            qkv = apply_rotary_emb_qkv_(
+                qkv,
+                rotary_pos_emb_cos,
+                rotary_pos_emb_sin,
+                interleaved=not self.apply_rotary_emb.is_neox_style,
+            )
+            q, k, v = qkv.unbind(dim=2)
+        elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             qk, v = qkv[:, :, :2], qkv[:, :, 2]
 
             qk_reshaped = einops.rearrange(
@@ -444,6 +459,7 @@ class Qwen2_5_VisionAttention(nn.Module):
                 self.hidden_size_per_attention_head,
             )
             q, k = qk_rotated.unbind(dim=0)
+            del qk, qk_reshaped, qk_rotated
         else:
             q, k, v = qkv.unbind(dim=2)
 
@@ -455,6 +471,7 @@ class Qwen2_5_VisionAttention(nn.Module):
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
         )
+        del x, qkv, q, k, v
 
         context_layer = einops.rearrange(
             context_layer, "b s h d -> s b (h d)", b=batch_size

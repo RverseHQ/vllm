@@ -48,6 +48,7 @@ from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
 )
 from transformers.video_utils import VideoMetadata
 
+from vllm import envs
 from vllm.compilation.decorators import (
     should_torch_compile_mm_encoder,
     support_torch_compile,
@@ -74,10 +75,12 @@ from vllm.model_executor.layers.fusion.mm_input_norm import (
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.utils import default_unquantized_gemm
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -168,9 +171,51 @@ from .vision import (
 
 logger = init_logger(__name__)
 
+VISION_MLP_CHUNK_TOKENS = 2048
+
 # We use 2048 dummy video frames that would generate vision embeddings
 # of the maximum size.
 DUMMY_VIDEO_NUM_FRAMES = 2048
+
+
+@torch.library.custom_op("qwen_vision::chunked_bf16_mlp", mutates_args=())
+def chunked_bf16_mlp(
+    x: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc1_bias: torch.Tensor | None,
+    fc2_weight: torch.Tensor,
+    fc2_bias: torch.Tensor | None,
+    approximate: str,
+    chunk_tokens: int,
+) -> torch.Tensor:
+    flat = x.reshape(-1, x.shape[-1])
+    rows = flat.shape[0]
+    chunks = (rows + chunk_tokens - 1) // chunk_tokens
+    base, extra = divmod(rows, chunks)
+    output = x.new_empty((rows, fc2_weight.shape[0]))
+    start = 0
+    for index in range(chunks):
+        end = start + base + (index < extra)
+        hidden = F.linear(flat[start:end], fc1_weight, fc1_bias)
+        torch.ops.aten.gelu.out(hidden, approximate=approximate, out=hidden)
+        output[start:end].copy_(F.linear(hidden, fc2_weight, fc2_bias))
+        del hidden
+        start = end
+    return output.view(*x.shape[:-1], fc2_weight.shape[0])
+
+
+@chunked_bf16_mlp.register_fake
+def _chunked_bf16_mlp_fake(
+    x: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc1_bias: torch.Tensor | None,
+    fc2_weight: torch.Tensor,
+    fc2_bias: torch.Tensor | None,
+    approximate: str,
+    chunk_tokens: int,
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], fc2_weight.shape[0]))
+
 
 # ---------------------------------------------------------------------------
 # Triton kernel: fused bilinear position-embedding interpolation
@@ -435,10 +480,52 @@ class Qwen3_VisionMLP(nn.Module):
             disable_tp=use_data_parallel,
         )
         self.act_fn = act_fn
+        self._gelu_approximation = (
+            act_fn.approximate if isinstance(act_fn, nn.GELU) else None
+        )
+        self._vision_chunk_tokens = (
+            VISION_MLP_CHUNK_TOKENS
+            if self._gelu_approximation is not None
+            and isinstance(self.linear_fc1.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.linear_fc2.quant_method, UnquantizedLinearMethod)
+            and self.linear_fc1.quant_method._gemm_impl is default_unquantized_gemm
+            and self.linear_fc2.quant_method._gemm_impl is default_unquantized_gemm
+            and self.linear_fc1.tp_size == self.linear_fc2.tp_size == 1
+            and not envs.VLLM_BATCH_INVARIANT
+            else 0
+        )
 
     def forward(self, x: torch.Tensor):
-        mlp_output = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-        return mlp_output
+        def whole(batch: torch.Tensor) -> torch.Tensor:
+            hidden = self.linear_fc1(batch)
+            if self._gelu_approximation is None:
+                hidden = self.act_fn(hidden)
+            else:
+                hidden = torch.ops.aten.gelu.out(
+                    hidden, approximate=self._gelu_approximation, out=hidden
+                )
+            return self.linear_fc2(hidden)
+
+        if not self._vision_chunk_tokens:
+            return whole(x)
+
+        def chunked(batch: torch.Tensor) -> torch.Tensor:
+            return chunked_bf16_mlp(
+                batch,
+                self.linear_fc1.weight,
+                self.linear_fc1.bias,
+                self.linear_fc2.weight,
+                self.linear_fc2.bias,
+                self._gelu_approximation,
+                self._vision_chunk_tokens,
+            )
+
+        return torch.cond(
+            x.numel() // x.shape[-1] > self._vision_chunk_tokens,
+            chunked,
+            whole,
+            (x,),
+        )
 
 
 @support_torch_compile(
@@ -462,8 +549,10 @@ class Qwen3_VisionBlock(nn.Module):
         norm_layer: Callable[[int], nn.Module] | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        inplace_residual: bool = False,
     ) -> None:
         super().__init__()
+        self.inplace_residual = inplace_residual
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = norm_layer(dim)
@@ -493,7 +582,7 @@ class Qwen3_VisionBlock(nn.Module):
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
         sequence_lengths: torch.Tensor,  # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
-        x = x + self.attn(
+        attention = self.attn(
             self.norm1(x),
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
@@ -502,7 +591,16 @@ class Qwen3_VisionBlock(nn.Module):
             sequence_lengths=sequence_lengths,
         )
 
-        x = x + self.mlp(self.norm2(x))
+        if self.inplace_residual:
+            x.add_(attention)
+        else:
+            x = x + attention
+        del attention
+        mlp = self.mlp(self.norm2(x))
+        if self.inplace_residual:
+            x.add_(mlp)
+        else:
+            x = x + mlp
         return x
 
 
@@ -671,6 +769,7 @@ class Qwen3_VisionTransformer(nn.Module):
                     norm_layer=norm_layer,
                     quant_config=quant_config,
                     prefix=f"{prefix}.blocks.{layer_idx}",
+                    inplace_residual=True,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
