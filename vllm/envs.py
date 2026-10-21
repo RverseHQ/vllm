@@ -129,6 +129,9 @@ if TYPE_CHECKING:
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+    VLLM_QWEN_GDN_FP8_OUTPUT: bool = False
+    VLLM_QWEN_FA3_FP8_OUTPUT: bool = False
+    VLLM_QWEN_GDN_DEVICE_METADATA: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
@@ -1220,6 +1223,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "cuda",
         ["cuda", "triton"],
         case_sensitive=False,
+    ),
+    "VLLM_QWEN_GDN_FP8_OUTPUT": lambda: bool(
+        int(os.getenv("VLLM_QWEN_GDN_FP8_OUTPUT", "0"))
+    ),
+    "VLLM_QWEN_FA3_FP8_OUTPUT": lambda: bool(
+        int(os.getenv("VLLM_QWEN_FA3_FP8_OUTPUT", "0"))
+    ),
+    "VLLM_QWEN_GDN_DEVICE_METADATA": lambda: bool(
+        int(os.getenv("VLLM_QWEN_GDN_DEVICE_METADATA", "0"))
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (

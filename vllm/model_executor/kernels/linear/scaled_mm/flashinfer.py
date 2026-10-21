@@ -35,6 +35,8 @@ from .ScaledMMLinearKernel import (
     FP8ScaledMMLinearLayerConfig,
 )
 
+_DEEPGEMM_MIN_BATCH_SIZE = 32
+
 
 class FlashInferFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     @classmethod
@@ -180,6 +182,33 @@ class FlashInferFp8DeepGEMMDynamicBlockScaledKernel(
         # parameter tensor layout so processing once is sufficient.
         self.fallback.process_weights_after_loading(layer)
 
+    @staticmethod
+    def uses_deep_gemm(num_rows: int) -> bool:
+        return envs.VLLM_BATCH_INVARIANT or num_rows >= _DEEPGEMM_MIN_BATCH_SIZE
+
+    def apply_prequantized_mm(
+        self,
+        q_input: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project a producer's FP8 values with the existing DeepGEMM kernel."""
+        output = torch.empty(
+            (q_input.shape[0], weight.shape[0]),
+            dtype=self.config.out_dtype,
+            device=q_input.device,
+        )
+        torch.ops.vllm.fp8_gemm_nt_op(
+            q_input,
+            input_scale,
+            weight,
+            weight_scale,
+            output,
+            self.fallback.use_deep_gemm_e8m0,
+        )
+        return output
+
     def apply_block_scaled_mm(
         self,
         A: torch.Tensor,
@@ -298,7 +327,7 @@ def _dynamic_flashinfer_deepgemm_blockscale_gemm_impl(
     if envs.VLLM_BATCH_INVARIANT:
         return run_deepgemm(input, weight, weight_scale)
 
-    condition = input.shape[0] < 32
+    condition = input.shape[0] < _DEEPGEMM_MIN_BATCH_SIZE
 
     # PyTorch's torch.compile cannot handle input-dependent control flow in standard
     # Python conditionals. torch.cond() explicitly registers both code paths in the
