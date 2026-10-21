@@ -1209,22 +1209,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
         )
         if use_fused_gdn_spec_decode:
-            if (
-                envs.VLLM_QWEN_GDN_FP8_OUTPUT
-                and self._gdn_fp8_output_kernel(num_tokens) is not None
-            ):
-                output = torch.empty(
-                    (num_tokens, self.out_proj.output_size),
-                    dtype=torch.bfloat16,
+            kernel = (
+                self._gdn_fp8_output_kernel(num_tokens)
+                if envs.VLLM_QWEN_GDN_FP8_OUTPUT
+                else None
+            )
+            if kernel is not None:
+                quantized = torch.zeros(
+                    (num_tokens, self.num_v_heads, self.head_v_dim),
+                    dtype=torch.float8_e4m3fn,
                     device=hidden_states.device,
                 )
+                scales = torch.full(
+                    (self.num_v_heads, num_tokens),
+                    2.0**-33,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                ).t()
                 torch.ops.vllm.qwen_gdn_attention_core_fused_norm_fp8_packed(
                     mixed_qkvz,
                     ba,
-                    output,
+                    quantized,
+                    scales,
                     layer_name=_encode_layer_name(self.prefix),
                 )
-                return output
+                return kernel.apply_prequantized_mm(
+                    quantized.flatten(-2),
+                    scales,
+                    self.out_proj.weight,
+                    self.out_proj.weight_scale_inv,
+                )
             core_attn_out = torch.zeros(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
@@ -2260,7 +2274,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
     def _forward_core_fused_norm_fp8_packed(
-        self, mixed_qkvz: torch.Tensor, ba: torch.Tensor, output: torch.Tensor
+        self,
+        mixed_qkvz: torch.Tensor,
+        ba: torch.Tensor,
+        quantized: torch.Tensor,
+        out_scales: torch.Tensor,
     ) -> None:
         context = get_forward_context()
         metadata = (
@@ -2268,10 +2286,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if isinstance(context.attn_metadata, dict)
             else None
         )
-        kernel = self._gdn_fp8_output_kernel(mixed_qkvz.shape[0])
         if (
-            kernel is None
-            or not isinstance(metadata, GDNAttentionMetadata)
+            not isinstance(metadata, GDNAttentionMetadata)
             or metadata.num_prefills != 0
             or not self._can_use_fused_gdn_mtp_decode(metadata)
             or self.kv_cache[1].dtype != torch.float32
@@ -2286,42 +2302,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 device=mixed_qkvz.device,
             )
             self._forward_core_fused_norm_packed(mixed_qkvz, ba, core)
-            projected, _ = self.out_proj(core.flatten(-2))
-        else:
-            qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-            mixed_qkv, gate = mixed_qkvz.split(
-                [qkv_size, self.value_dim // self.tp_size], dim=-1
-            )
-            b, a = self.split_ba(ba)
-            rows = mixed_qkvz.shape[0]
-            # CUDA-graph padding remains the quantization of the old zero rows.
-            quantized = torch.zeros(
-                (rows, self.num_v_heads, self.head_v_dim),
-                dtype=torch.float8_e4m3fn,
-                device=mixed_qkvz.device,
-            )
-            scales = torch.full(
-                (self.num_v_heads, rows),
-                2.0**-33,
-                dtype=torch.float32,
-                device=mixed_qkvz.device,
-            ).t()
-            self._forward_core_decode_spec_fused_norm(
-                mixed_qkv=mixed_qkv,
-                b=b,
-                a=a,
-                output_gate=gate.reshape(rows, self.num_v_heads, self.head_v_dim),
-                core_attn_out=quantized,
-                attn_metadata=metadata,
-                out_scales=scales,
-            )
-            projected = kernel.apply_prequantized_mm(
+            torch.ops._C.per_token_group_fp8_quant(
+                core.flatten(-2),
                 quantized.flatten(-2),
-                scales,
-                self.out_proj.weight,
-                self.out_proj.weight_scale_inv,
+                out_scales,
+                128,
+                1e-10,
+                -448.0,
+                448.0,
+                True,
+                True,
+                False,
             )
-        output.copy_(projected)
+            return
+
+        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+        mixed_qkv, gate = mixed_qkvz.split(
+            [qkv_size, self.value_dim // self.tp_size], dim=-1
+        )
+        b, a = self.split_ba(ba)
+        self._forward_core_decode_spec_fused_norm(
+            mixed_qkv=mixed_qkv,
+            b=b,
+            a=a,
+            output_gate=gate.reshape(
+                mixed_qkvz.shape[0], self.num_v_heads, self.head_v_dim
+            ),
+            core_attn_out=quantized,
+            attn_metadata=metadata,
+            out_scales=out_scales,
+        )
 
     def _can_use_fused_gdn_mtp_decode(
         self, attn_metadata: GDNAttentionMetadata
@@ -2567,17 +2577,18 @@ direct_register_custom_op(
 def qwen_gdn_attention_core_fused_norm_fp8_packed(
     mixed_qkvz: torch.Tensor,
     ba: torch.Tensor,
-    output: torch.Tensor,
+    quantized: torch.Tensor,
+    out_scales: torch.Tensor,
     layer_name: LayerNameType,
 ) -> None:
     layer_name = _resolve_layer_name(layer_name)
     context: ForwardContext = get_forward_context()
     layer = context.no_compile_layers[layer_name]
-    layer._forward_core_fused_norm_fp8_packed(mixed_qkvz, ba, output)
+    layer._forward_core_fused_norm_fp8_packed(mixed_qkvz, ba, quantized, out_scales)
 
 
 direct_register_custom_op(
     op_name="qwen_gdn_attention_core_fused_norm_fp8_packed",
     op_func=qwen_gdn_attention_core_fused_norm_fp8_packed,
-    mutates_args=["output"],
+    mutates_args=["quantized", "out_scales"],
 )
