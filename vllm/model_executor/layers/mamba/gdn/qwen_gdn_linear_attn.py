@@ -2168,6 +2168,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.num_spec + 1 if self.use_gdn_recovery else state_indices.size(1)
             ),
             validate_data=False,
+            out=(
+                self.gdn_replay.mixed_qkv[:num_actual_tokens]
+                if isinstance(attn_metadata, GDNRecoverAttentionMetadata)
+                else None
+            ),
         )
         self._forward_core_decode_spec_post_conv_fused_norm(
             mixed_qkv=mixed_qkv,
@@ -2393,8 +2398,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             "GDN replay token capacity exceeded"
         )
         self.gdn_replay.mixed_qkv[:n].copy_(mixed_qkv)
-        self.gdn_replay.a[:n].copy_(a)
-        self.gdn_replay.b[:n].copy_(b)
+        self.gdn_replay.save_gates(a, b)
 
     def uses_native_gdn_recovery(self, metadata: GDNRecoverAttentionMetadata) -> bool:
         # Match the original producer route, including mixed-prefill exclusion.

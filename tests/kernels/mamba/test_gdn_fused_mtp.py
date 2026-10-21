@@ -418,6 +418,34 @@ def test_native_fp8_output_matches_official_quantizer(
     check_native_output(rows, padding, activation, norm_dtype, installed=True)
 
 
+@pytest.mark.parametrize("rows", [32, 192])
+def test_recovery_payload_preserves_strided_gates_on_graph_replay(rows: int) -> None:
+    from vllm.model_executor.layers.mamba.ops.gdn_recover import GdnRecoverPayload
+
+    torch.manual_seed(7)
+    packed = torch.randn(rows, 96, device="cuda", dtype=torch.bfloat16)
+    b, a = packed.chunk(2, dim=-1)
+    payload = GdnRecoverPayload(
+        torch.empty(192, 10240, device="cuda", dtype=torch.bfloat16),
+        torch.full((192, 48), 93, device="cuda", dtype=torch.bfloat16),
+        torch.full((192, 48), 93, device="cuda", dtype=torch.bfloat16),
+    )
+    payload.save_gates(a, b)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        payload.save_gates(a, b)
+    for _ in range(2):
+        packed.neg_()
+        payload.a.fill_(93)
+        payload.b.fill_(93)
+        expected_a, expected_b = payload.a.clone(), payload.b.clone()
+        expected_a[:rows].copy_(a)
+        expected_b[:rows].copy_(b)
+        graph.replay()
+        assert torch.equal(payload.a.view(torch.int16), expected_a.view(torch.int16))
+        assert torch.equal(payload.b.view(torch.int16), expected_b.view(torch.int16))
+
+
 @pytest.mark.parametrize(
     "rows,expected",
     [(4, False), (31, False), (32, True), (192, True), (193, False), (16384, False)],

@@ -368,18 +368,29 @@ def test_causal_conv1d_varlen(
 @pytest.mark.parametrize("width", [4])
 @pytest.mark.parametrize("dim", [64, 2048])
 @pytest.mark.parametrize("q_lens_cfg", [[3, 1, 0, 4, 2], [1, 5, 5, 1], [2, 0, 0, 3]])
+@pytest.mark.parametrize("separate_output", [False, True])
 @pytest.mark.skipif(
     current_platform.is_cpu(),
     reason="CPU kernel for causal_conv1d_update ignores num_accepted_tokens.",
 )
 def test_causal_conv1d_update_ragged_varlen(
-    q_lens_cfg, dim, width, has_bias, silu_activation, itype
+    q_lens_cfg, dim, width, has_bias, silu_activation, itype, separate_output
 ):
     mk_inputs = lambda: _create_ragged_varlen_inputs(
         q_lens_cfg, dim, width, has_bias, silu_activation, itype
     )
     inputs, state = mk_inputs()
-    actual = causal_conv1d_update(conv_state=state, **inputs)
+    original_x = inputs["x"].clone()
+    output = None
+    if separate_output:
+        packed = torch.empty(original_x.shape[0], 2 * dim, dtype=itype, device=DEVICE)
+        inputs["x"] = packed[:, :dim]
+        inputs["x"].copy_(original_x)
+        output = torch.empty_like(original_x)
+    actual = causal_conv1d_update(conv_state=state, out=output, **inputs)
+    if output is not None:
+        assert actual.data_ptr() == output.data_ptr()
+        assert torch.equal(inputs["x"], original_x)
 
     ref_inputs, ref_state = mk_inputs()
     ref_outs = _create_ragged_varlen_ref_outs(conv_state=ref_state, **ref_inputs)
