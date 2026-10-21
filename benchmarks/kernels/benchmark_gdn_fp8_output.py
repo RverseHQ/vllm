@@ -51,8 +51,6 @@ STABLE_TORCH_LIBRARY_IMPL(qwen_gdn_probe, CUDA, m) {
 def build_probe(build_dir: Path) -> None:
     """Compile actual production source files, never copied kernel formulas."""
     includes = [str(ROOT / "csrc")]
-    nvidia = Path(torch.__file__).resolve().parent.parent / "nvidia"
-    includes.extend(str(p) for p in nvidia.glob("*/include"))
     for name, binding, source, flags in (
         (
             "gdn",

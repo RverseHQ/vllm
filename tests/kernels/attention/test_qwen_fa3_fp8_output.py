@@ -302,11 +302,11 @@ def test_q4_gate_quant_matches_bf16_rounding_and_projection(hopper, num_splits, 
     q = torch.randn(n, 24, 256, device="cuda", dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
     )
-    # The accepted physical KV layout: [page, head, page_size, 2*head_dim].
-    cache = torch.randn(21, 4, 1600, 512, device="cuda", dtype=torch.bfloat16).to(
+    # Default LBNHC storage: [page, token, head, 2*head_dim].
+    cache = torch.randn(21, 1600, 4, 512, device="cuda", dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
     )
-    k, v = cache.transpose(1, 2).split(256, dim=-1)
+    k, v = cache.split(256, dim=-1)
     gate = torch.randn(rows, 6144, device="cuda", dtype=torch.bfloat16) * 4
     cu_q = torch.tensor([0, *q_lens], device="cuda", dtype=torch.int32).cumsum(
         0, dtype=torch.int32
