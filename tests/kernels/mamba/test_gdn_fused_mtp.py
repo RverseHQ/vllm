@@ -121,6 +121,7 @@ def _build_layer(
         layer_norm_epsilon=EPS,
         gdn_decode_kernel="cuda",
         use_gdn_recovery=False,
+        _fp8_output_device_supported=current_platform.has_device_capability(90),
         num_spec=NUM_SPEC,
     )
     with set_current_vllm_config(vllm_config):
@@ -417,8 +418,10 @@ def test_native_fp8_output_matches_official_quantizer(
 @pytest.mark.parametrize(
     "rows,expected", [(4, False), (31, False), (32, True), (192, True)]
 )
-def test_gdn_fp8_output_preserves_small_batch_route(rows: int, expected: bool) -> None:
-    """Only the existing group128/E8M0 DeepGEMM branch can consume fused output."""
+def test_gdn_fp8_output_compiles_existing_batch_routes(
+    rows: int, expected: bool
+) -> None:
+    """Dynamo must trace the existing batch cutoff without querying NVML."""
     if not hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp_fp8"):
         pytest.skip("fused GDN FP8 output op is not built")
     kernel_type = qwen_gdn_linear_attn.FlashInferFp8DeepGEMMDynamicBlockScaledKernel
@@ -428,14 +431,25 @@ def test_gdn_fp8_output_preserves_small_batch_route(rows: int, expected: bool) -
     method = object.__new__(qwen_gdn_linear_attn.Fp8LinearMethod)
     method.fp8_linear = kernel
     layer = types.SimpleNamespace(
-        tp_size=1, out_proj=types.SimpleNamespace(quant_method=method, bias=None)
+        tp_size=1,
+        _fp8_output_device_supported=True,
+        out_proj=types.SimpleNamespace(quant_method=method, bias=None),
     )
-    with (
-        patch.object(current_platform, "has_device_capability", return_value=True),
-        patch.object(qwen_gdn_linear_attn.envs, "VLLM_BATCH_INVARIANT", False),
-    ):
+    with patch.object(qwen_gdn_linear_attn.envs, "VLLM_BATCH_INVARIANT", False):
         actual = QwenGatedDeltaNetAttention._gdn_fp8_output_kernel(layer, rows)
-    assert (actual is kernel) == expected
+        assert (actual is kernel) == expected
+
+        def forward(x):
+            selected = QwenGatedDeltaNetAttention._gdn_fp8_output_kernel(
+                layer, x.shape[0]
+            )
+            return x + int(selected is kernel)
+
+        compiled = torch.compile(forward, backend="eager", fullgraph=True)
+        inputs = torch.zeros(rows)
+        torch.testing.assert_close(
+            compiled(inputs), torch.full_like(inputs, float(expected)), atol=0, rtol=0
+        )
 
 
 def test_gdn_fp8_output_preserves_raw_activation_consumers() -> None:

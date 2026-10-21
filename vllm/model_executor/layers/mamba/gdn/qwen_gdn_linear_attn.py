@@ -590,6 +590,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
         self.qkvz_layout = "interleaved" if gqa_interleaved_layout else "flat"
+        self._fp8_output_device_supported = current_platform.has_device_capability(90)
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_cpu():
@@ -1288,7 +1289,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if (
             self.tp_size != 1
             or self.out_proj.bias is not None
-            or not current_platform.has_device_capability(90)
+            or not self._fp8_output_device_supported
             or not isinstance(method, Fp8LinearMethod)
             or not isinstance(
                 method.fp8_linear, FlashInferFp8DeepGEMMDynamicBlockScaledKernel

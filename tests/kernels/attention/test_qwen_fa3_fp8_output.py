@@ -381,7 +381,6 @@ def test_qwen_preserves_bf16_projection_routes(monkeypatch, rows, enabled, raw_i
 
     monkeypatch.setattr(model.envs, "VLLM_QWEN_FA3_FP8_OUTPUT", enabled)
     monkeypatch.setattr(model.envs, "VLLM_BATCH_INVARIANT", False)
-    monkeypatch.setattr(model.current_platform, "is_device_capability", lambda _: True)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: raw_input)
     monkeypatch.setattr(
         model,
@@ -419,6 +418,7 @@ def test_qwen_preserves_bf16_projection_routes(monkeypatch, rows, enabled, raw_i
     attention = object.__new__(model.Qwen3NextAttention)
     torch.nn.Module.__init__(attention)
     attention.use_fused_qk_norm_rope_gate = False
+    attention._fp8_output_device_supported = True
     attention.num_heads, attention.head_dim = 24, 256
     attention.qkv_proj, attention.attn, attention.o_proj = (
         QKV(),

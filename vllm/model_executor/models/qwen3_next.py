@@ -428,6 +428,7 @@ class Qwen3NextAttention(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self._fp8_output_device_supported = current_platform.is_device_capability(90)
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -642,7 +643,7 @@ class Qwen3NextAttention(nn.Module):
                 and output_kernel.weight_group_shape.col == 128
                 and output_kernel.fallback.use_deep_gemm_e8m0
                 and output_kernel.uses_deep_gemm(q.shape[0])
-                and current_platform.is_device_capability(90)
+                and self._fp8_output_device_supported
             ):
                 q_output, output_scale = qwen_attention_fp8_output(
                     q, k, v, gate, self.attn.layer_name
