@@ -78,6 +78,69 @@ def _decode_step():
     return builder, common
 
 
+@pytest.mark.parametrize(
+    "mode,capture_size,expected_capacity",
+    [("NONE", 0, 48), ("FULL_AND_PIECEWISE", 192, 192)],
+)
+def test_recovery_metadata_covers_real_request_capacity(
+    mode, capture_size, expected_capacity
+):
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_vllm_config,
+    )
+    from vllm.config import CUDAGraphMode, SpeculativeConfig, set_current_vllm_config
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+    from vllm.model_executor.layers.mamba.ops.gdn_recover import GdnRecoverBatchStorage
+
+    device = torch.device("cuda")
+    config = create_vllm_config(
+        model_name="Qwen/Qwen3.5-0.8B",
+        block_size=1600,
+        max_model_len=4096,
+        max_num_seqs=48,
+    )
+    config.additional_config = {"gdn_prefill_backend": "triton"}
+    config.compilation_config.cudagraph_mode = CUDAGraphMode[mode]
+    config.compilation_config.max_cudagraph_capture_size = capture_size
+    config.speculative_config = SpeculativeConfig(
+        method="ngram", num_speculative_tokens=3
+    )
+    prefix = "model.layers.0.linear_attn"
+    layer = object.__new__(QwenGatedDeltaNetAttention)
+    torch.nn.Module.__init__(layer)
+    layer.gdn_recovery_storage = GdnRecoverBatchStorage(device)
+    config.compilation_config.static_forward_context[prefix] = layer
+    spec = MambaSpec(
+        block_size=1600,
+        shapes=((6, 10240), (48, 128, 128)),
+        dtypes=(torch.bfloat16, torch.float32),
+        num_speculative_blocks=0,
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[8] * 48, query_lens=[4] * 48),
+        1600,
+        device,
+        arange_block_indices=True,
+    )
+    common.block_table_tensor.add_(1)
+    with set_current_vllm_config(config):
+        builder = GDNRecoverAttentionMetadataBuilder(spec, [prefix], config, device)
+        metadata = builder.build(
+            0,
+            common,
+            num_accepted_tokens=torch.ones(48, device=device, dtype=torch.int32),
+            num_decode_draft_tokens_cpu=torch.full((48,), 3, dtype=torch.int32),
+        )
+    assert metadata.num_spec_decodes == 48
+    assert metadata.verify_indices.shape == (expected_capacity, 5)
+    assert metadata.verify_indices[:48, -1].tolist() == list(range(1, 49))
+    assert metadata.source_selectors[:48].tolist() == [5] * 48
+
+
 def test_recovery_builder_uses_device_lengths_and_clears_padding():
     builder, common = _decode_step()
     metadata = builder.build(
