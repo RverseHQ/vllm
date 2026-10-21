@@ -234,14 +234,15 @@ extern "C" int launch_gate_helper(void const* a, void const* g, void* q,
     assert torch.equal(quant.view(torch.uint8), expected_q.view(torch.uint8))
 
 
-def test_bf16_fallback_matches_native_quantization_with_padding():
+def test_bf16_fallback_quantizes_flat_queries_before_head_view(monkeypatch):
     import torch
 
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    from vllm.model_executor.layers.attention.qwen_fp8_output import (
-        gate_quant_bf16_attention,
-    )
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.attention import qwen_fp8_output
+    from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+    from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 
     rows, columns, actual = 64, 6144, 63
     generator = torch.Generator(device="cuda").manual_seed(41)
@@ -272,7 +273,36 @@ def test_bf16_fallback_matches_native_quantization_with_padding():
     )
     quant = torch.empty_like(attention, dtype=torch.float8_e4m3fn)
     scale = torch.empty(columns // 128, rows, dtype=torch.float32, device="cuda").t()
-    gate_quant_bf16_attention(attention, gate, quant, scale, actual)
+    with set_current_vllm_config(VllmConfig()):
+        query_quant = QuantFP8(
+            static=True, group_shape=GroupShape.PER_TENSOR, compile_native=False
+        )
+
+    def backend_forward(layer, query, key, value, kv_cache, metadata, *, output):
+        assert query.dtype == torch.float8_e4m3fn
+        assert query.shape == (rows, 24, 256)
+        output.copy_(attention.view_as(output))
+
+    layer = SimpleNamespace(
+        num_heads=24,
+        head_size=256,
+        num_kv_heads=4,
+        head_size_v=256,
+        query_quant=query_quant.forward_cuda,
+        _q_scale=torch.ones(1, device="cuda"),
+        impl=SimpleNamespace(supports_quant_query_input=True, forward=backend_forward),
+        attn_backend=SimpleNamespace(forward_includes_kv_cache_update=True),
+    )
+    metadata = SimpleNamespace(num_actual_tokens=actual)
+    monkeypatch.setattr(
+        qwen_fp8_output,
+        "get_attention_context",
+        lambda _: (metadata, layer, None, None),
+    )
+    key = torch.zeros(rows, 1024, dtype=torch.bfloat16, device="cuda")
+    torch.ops.vllm.qwen_fa3_gate_quant(
+        attention, key, key, gate, quant, scale, "attention"
+    )
     assert torch.equal(quant[:actual].view(torch.uint8), expected_q.view(torch.uint8))
     assert torch.equal(scale[:actual], expected_scale)
     assert quant[3, 0].float().item() == 1.875

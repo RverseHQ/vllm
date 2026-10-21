@@ -142,11 +142,11 @@ def qwen_fa3_gate_quant(
     layer_name: str,
 ) -> None:
     metadata, layer, kv_cache, _ = get_attention_context(layer_name)
+    if layer.query_quant is not None and layer.impl.supports_quant_query_input:
+        query, _ = layer.query_quant(query, layer._q_scale)
     query = query.view(-1, layer.num_heads, layer.head_size)
     key = key.view(-1, layer.num_kv_heads, layer.head_size)
     value = value.view(-1, layer.num_kv_heads, layer.head_size_v)
-    if layer.query_quant is not None and layer.impl.supports_quant_query_input:
-        query, _ = layer.query_quant(query, layer._q_scale)
     if (
         not layer.attn_backend.forward_includes_kv_cache_update
         and layer.kv_sharing_target_layer_name is None
