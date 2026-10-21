@@ -1,0 +1,262 @@
+--- a/hopper/flash.h
++++ b/hopper/flash.h
+@@ -40,6 +40,13 @@
+     // The O matrix (output).
+     void * __restrict__ o_ptr;
+     void * __restrict__ oaccum_ptr;
++
++    // Only the independent Qwen Q4 gate-quant ABI populates these.
++    void const* gate_ptr = nullptr;
++    void* gate_quant_ptr = nullptr;
++    float* gate_scale_ptr = nullptr;
++    index_t gate_row_stride = 0;
++    index_t gate_scale_col_stride = 0;
+ 
+     // The stride between rows of O.
+     index_t o_batch_stride;
+--- a/hopper/flash_api.cpp
++++ b/hopper/flash_api.cpp
+@@ -771,7 +771,10 @@
+         const std::optional<Tensor> &s_aux_, // (h)
+         int const cp_world_size,  // context parallelism (cp) world size
+         int const cp_rank,         // cp rank
+-        const std::optional<Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
++        const std::optional<Tensor> &cp_tot_seqused_k_, // b. total seqused_k in cp world
++        const std::optional<Tensor> &gate_,
++        const std::optional<Tensor> &gate_quant_,
++        const std::optional<Tensor> &gate_scale_
+         ) {
+ 
+     auto dprops = get_device_prop();
+@@ -1068,6 +1071,35 @@
+     bool const use_dynamic_split = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
+     // disable split for varlen and >992 batches for now
+     if (use_prepare_varlen && params.b > PREPARE_VARLEN_MAX_BATCHES_1CTA) { params.num_splits = 1; }
++
++    if (gate_.has_value()) {
++        STD_TORCH_CHECK(gate_quant_.has_value() && gate_scale_.has_value());
++        auto const& gate = gate_.value();
++        auto const& quant = gate_quant_.value();
++        auto const& scale = gate_scale_.value();
++        CHECK_DEVICE(gate); CHECK_DEVICE(quant); CHECK_DEVICE(scale);
++        STD_TORCH_CHECK(gate.get_device_index() == q.get_device_index() &&
++                        quant.get_device_index() == q.get_device_index() &&
++                        scale.get_device_index() == q.get_device_index());
++        STD_TORCH_CHECK(q_type == ScalarType::Float8_e4m3fn &&
++                        gate.scalar_type() == ScalarType::BFloat16 &&
++                        quant.scalar_type() == ScalarType::Float8_e4m3fn &&
++                        scale.scalar_type() == ScalarType::Float);
++        STD_TORCH_CHECK(is_varlen_q && num_heads == 24 && head_size_v == 256 &&
++                        params.num_splits > 1 && batch_size <= PREPARE_VARLEN_MAX_BATCHES_1CTA,
++                        "gate-quant requires the Q4 split final-combine path");
++        STD_TORCH_CHECK(gate.dim() == 2 && quant.dim() == 2 && scale.dim() == 2);
++        STD_TORCH_CHECK(gate.size(0) >= total_q && gate.size(1) == num_heads * head_size_v);
++        STD_TORCH_CHECK(quant.size(0) >= total_q && quant.size(1) == num_heads * head_size_v);
++        STD_TORCH_CHECK(scale.size(0) == quant.size(0) && scale.size(1) == num_heads * 2);
++        STD_TORCH_CHECK(gate.stride(1) == 1 && quant.is_contiguous() &&
++                        scale.stride(0) == 1 && scale.stride(1) == quant.size(0));
++        params.gate_ptr = gate.data_ptr();
++        params.gate_quant_ptr = quant.data_ptr();
++        params.gate_scale_ptr = static_cast<float*>(scale.data_ptr());
++        params.gate_row_stride = gate.stride(0);
++        params.gate_scale_col_stride = scale.stride(1);
++    }
+ 
+     // This needs to be set after get_num_splits
+     Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
+--- a/hopper/flash_api_torch_lib.cpp
++++ b/hopper/flash_api_torch_lib.cpp
+@@ -64,7 +64,10 @@
+         const std::optional<Tensor> &s_aux_,
+         int const cp_world_size,
+         int const cp_rank,
+-        const std::optional<Tensor> &cp_tot_seqused_k
++        const std::optional<Tensor> &cp_tot_seqused_k,
++        const std::optional<Tensor> &gate = std::nullopt,
++        const std::optional<Tensor> &gate_quant = std::nullopt,
++        const std::optional<Tensor> &gate_scale = std::nullopt
+ );
+ 
+ // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
+@@ -246,6 +249,27 @@
+       narrow_int64_to_int(sm_margin, "sm_margin"));
+ }
+ 
++// This independent ABI does not change fwd's schema or default behavior.
++void mha_fwd_gate_quant_stable(
++    Tensor q, Tensor k, Tensor v, Tensor gate, Tensor quant, Tensor scale,
++    Tensor cu_seqlens_q, Tensor seqused_k, int64_t max_seqlen_q,
++    int64_t max_seqlen_k, Tensor page_table,
++    std::optional<Tensor> q_descale, std::optional<Tensor> k_descale,
++    std::optional<Tensor> v_descale, double softmax_scale,
++    std::optional<Tensor> scheduler_metadata, int64_t num_splits) {
++    std::optional<Tensor> out;
++    mha_fwd(q, k, v, std::nullopt, std::nullopt, std::nullopt, out,
++        cu_seqlens_q, std::nullopt, std::nullopt, std::nullopt, seqused_k,
++        narrow_int64_to_int(max_seqlen_q, "max_seqlen_q"),
++        narrow_int64_to_int(max_seqlen_k, "max_seqlen_k"),
++        page_table, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
++        std::nullopt, q_descale, k_descale, v_descale,
++        narrow_double_to_float(softmax_scale, "softmax_scale"),
++        true, -1, -1, 0.f, true, scheduler_metadata,
++        narrow_int64_to_int(num_splits, "num_splits"), std::nullopt, 0,
++        std::nullopt, 1, 0, std::nullopt, gate, quant, scale);
++}
++
+ } // namespace
+ 
+ /**
+@@ -290,6 +314,12 @@
+             "    int      cp_rank,"
+             "    Tensor?  cp_tot_seqused_k) -> Tensor[]");
+ 
++    ops.def("fwd_gate_quant(Tensor q, Tensor k, Tensor v, Tensor gate, "
++            "Tensor! quant, Tensor! scale, Tensor cu_seqlens_q, Tensor seqused_k, "
++            "int max_seqlen_q, int max_seqlen_k, Tensor page_table, "
++            "Tensor? q_descale, Tensor? k_descale, Tensor? v_descale, "
++            "float softmax_scale, Tensor? scheduler_metadata, int num_splits) -> ()");
++
+     ops.def("get_scheduler_metadata("
+             "    int      batch_size,"
+             "    int      max_seqlen_q,"
+@@ -318,6 +348,7 @@
+ 
+ STABLE_TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, ops) {
+     ops.impl("fwd", TORCH_BOX(&mha_fwd_stable));
++    ops.impl("fwd_gate_quant", TORCH_BOX(&mha_fwd_gate_quant_stable));
+     ops.impl("get_scheduler_metadata",
+              TORCH_BOX(&mha_fwd_get_scheduler_metadata_stable));
+ }
+--- a/hopper/flash_fwd_combine_kernel.h
++++ b/hopper/flash_fwd_combine_kernel.h
+@@ -16,6 +16,7 @@
+ 
+ #include "seqlen.h"
+ #include "utils.h"
++#include "qwen_gate_quant.cuh"
+ 
+ namespace flash {
+ 
+@@ -155,6 +156,11 @@
+         int const* const num_splits_dynamic_ptr = nullptr;
+         int const* const varlen_batch_idx_ptr = nullptr;
+         int* const semaphore_to_reset = nullptr;
++        void const* gate_ptr = nullptr;
++        void* gate_quant_ptr = nullptr;
++        float* gate_scale_ptr = nullptr;
++        int64_t gate_row_stride = 0;
++        int64_t gate_scale_col_stride = 0;
+     };
+ 
+     // Kernel entry point API
+@@ -176,6 +182,11 @@
+         int const* const num_splits_dynamic_ptr = nullptr;
+         int const* const varlen_batch_idx_ptr = nullptr;
+         int* const semaphore_to_reset = nullptr;
++        void const* gate_ptr = nullptr;
++        void* gate_quant_ptr = nullptr;
++        float* gate_scale_ptr = nullptr;
++        int64_t gate_row_stride = 0;
++        int64_t gate_scale_col_stride = 0;
+     };
+ 
+     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
+@@ -200,7 +211,9 @@
+             args.seqused,
+             args.num_splits_dynamic_ptr,
+             args.varlen_batch_idx_ptr,
+-            args.semaphore_to_reset
++            args.semaphore_to_reset,
++            args.gate_ptr, args.gate_quant_ptr, args.gate_scale_ptr,
++            args.gate_row_stride, args.gate_scale_col_stride
+         };
+     }
+ 
+@@ -450,10 +463,36 @@
+ 
+         if (m_block >= cute::ceil_div(max_idx, Int<kBlockM>{})) { return; }
+ 
++        cutlass::FastDivmod seqlen_divmod_dynamic(seqlen);
+         int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[maybe_virtual_batch] : get<1>(params.shape_LSE_partial);
+-        if (num_splits <= 1) { return; }
+-
+-        cutlass::FastDivmod seqlen_divmod_dynamic(seqlen);
++        if (num_splits <= 1) {
++            // Dynamic SplitKV may choose one split for a particular sequence.
++            // Its forward epilogue already wrote the final BF16 output. Quantize
++            // that output, never the uninitialized partial-accumulation buffer.
++            if constexpr (kBlockK == 128 && kGmemThreadsPerRow == 32) {
++                if (params.gate_ptr) {
++                    cutlass::arch::wait_on_dependent_grids();
++                    int idx = m_block * kBlockM + thread_idx / 32;
++                    if (idx < max_idx) {
++                        int m_idx;
++                        int head = seqlen_divmod_dynamic.divmod(m_idx, idx);
++                        int row = offset + m_idx;
++                        int col = k_block * kBlockK + (thread_idx % 32) * 4;
++                        int64_t gate_idx = int64_t(row) * params.gate_row_stride + head * 256 + col;
++                        int64_t quant_idx = int64_t(row) * get<2>(params.shape_LSE_partial) * 256 + head * 256 + col;
++                        auto ptr = params.ptr_O + int64_t(row) * get<0>(params.stride_O) + head * get<2>(params.stride_O) + col;
++                        float attention[4];
++                        #pragma unroll
++                        for (int i = 0; i < 4; ++i) { attention[i] = float(ptr[i]); }
++                        qwen_gate_quant_warp(attention,
++                            static_cast<cutlass::bfloat16_t const*>(params.gate_ptr) + gate_idx,
++                            static_cast<cutlass::float_e4m3_t*>(params.gate_quant_ptr) + quant_idx,
++                            params.gate_scale_ptr + row + (head * 2 + k_block) * params.gate_scale_col_stride);
++                    }
++                }
++            }
++            return;
++        }
+ 
+         // Step 1: load LSE_partial from gmem -> smem
+         Tensor mLSEpartial = make_tensor(make_gmem_ptr(params.ptr_LSE_partial + offset * get<0>(params.stride_LSE_partial)),
+@@ -689,6 +728,34 @@
+         // Step 7: Write the final O to gmem
+         Tensor rO = make_tensor_like<Element>(tOrO);
+         flash::convert_type_out(tOrO, rO);
++        if constexpr (kBlockK == 128 && kGmemThreadsPerRow == 32) {
++            if (params.gate_ptr) {
++                // Each warp owns one row/group. The FP32 split accumulation and
++                // its BF16 attention rounding above are unchanged.
++                static_assert(CUTE_STATIC_V(size<0>(rO)) == 4);
++                #pragma unroll
++                for (int m = 0; m < size<1>(tOcO); ++m) {
++                    if (tObidh(m) >= 0) {
++                        int row = offset + tOmidx(m);
++                        int head = tObidh(m);
++                        #pragma unroll
++                        for (int k = 0; k < size<2>(tOcO); ++k) {
++                            int col = k_block * kBlockK + get<1>(tOcO(_0{}, _0{}, k));
++                            int64_t gate_idx = int64_t(row) * params.gate_row_stride + head * 256 + col;
++                            int64_t quant_idx = int64_t(row) * get<2>(params.shape_LSE_partial) * 256 + head * 256 + col;
++                            float attention[4];
++                            #pragma unroll
++                            for (int i = 0; i < 4; ++i) { attention[i] = float(rO(i, m, k)); }
++                            qwen_gate_quant_warp(attention,
++                                static_cast<cutlass::bfloat16_t const*>(params.gate_ptr) + gate_idx,
++                                static_cast<cutlass::float_e4m3_t*>(params.gate_quant_ptr) + quant_idx,
++                                params.gate_scale_ptr + row + (head * 2 + k_block) * params.gate_scale_col_stride);
++                        }
++                    }
++                }
++                return;
++            }
++        }
+         auto shape_O = make_shape(get<0>(params.shape_O_partial), get<1>(params.shape_O_partial) - k_block * kBlockK, get<3>(params.shape_O_partial), get<4>(params.shape_O_partial));
+         Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset * get<0>(params.stride_O) + k_block * kBlockK * get<1>(params.stride_O)),
+                                 shape_O, params.stride_O)(_, _, _, !Varlen ? batch : 0);
+--- a/hopper/flash_fwd_combine_launch_template.h
++++ b/hopper/flash_fwd_combine_launch_template.h
+@@ -36,7 +36,9 @@
+         {params.o_row_stride, _1{}, params.o_head_stride, !Varlen ? params.o_batch_stride : 0},  // stride_O
+         static_cast<float*>(params.softmax_lse_ptr),
+         {_1{}, !Varlen ? params.seqlen_q : params.total_q, !Varlen ? params.h * params.seqlen_q : 0},  // stride_LSE
+-        params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr, params.varlen_batch_idx_ptr, params.tile_count_semaphore
++        params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr, params.varlen_batch_idx_ptr, params.tile_count_semaphore,
++        params.gate_ptr, params.gate_quant_ptr, params.gate_scale_ptr,
++        params.gate_row_stride, params.gate_scale_col_stride
+     };
+ 
+     typename CombineKernel::SchedulerArguments scheduler_args  {

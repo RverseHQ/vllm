@@ -18,9 +18,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--cutlass-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--gate-quant", action="store_true")
+    parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
     pin = json.loads((HERE / "fa3_source_manifest.json").read_text())
-    space = args.source_dir / "build" / "vllm-fa3-fp8" / "q4-m64n128"
+    variant = "q4-m64n128-gate-quant" if args.gate_quant else "q4-m64n128"
+    space = (
+        args.output_dir or args.source_dir / "build" / "vllm-fa3-fp8" / variant
+    ).resolve()
     source, build = space / "source", space / "build"
     for directory in (source, build, space / "tmp"):
         directory.mkdir(parents=True, exist_ok=True)
@@ -46,6 +52,20 @@ def main():
         cwd=source,
         check=True,
     )
+    if args.gate_quant:
+        subprocess.run(
+            [
+                "patch",
+                "--batch",
+                "--fuzz=0",
+                "-p1",
+                "-i",
+                str(HERE / "fa3_fp8_gate_quant.patch"),
+            ],
+            cwd=source,
+            check=True,
+        )
+        shutil.copy2(HERE / "qwen_gate_quant.cuh", source / "hopper")
     tile = source / "hopper/tile_size.h"
     text = tile.read_text()
     anchor = "    if (element_size == 2) {"
@@ -91,6 +111,8 @@ void run_q4_m64(Flash_fwd_params &params, cudaStream_t stream) {
 }
 """)
     prefix, name = "qwen_q4_m64", "_qwen_q4_m64_C"
+    if args.gate_quant:
+        prefix, name = "qwen_q4_gate_quant", "_qwen_q4_gate_quant_C"
     symbols = (
         "Qkv_params",
         "Flash_fwd_params",
@@ -138,6 +160,20 @@ void run_q4_m64(Flash_fwd_params &params, cudaStream_t stream) {
         "-Xcompiler=-fvisibility=hidden",
         "--threads=1",
     ]
+    if args.prepare_only:
+        manifest = {
+            "namespace": name,
+            "source_sha256": {
+                str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in source.rglob("*")
+                if p.is_file()
+            },
+        }
+        (space / "source-manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n"
+        )
+        print(json.dumps(manifest), flush=True)
+        return
     os.environ.update(
         TMPDIR=str(space / "tmp"), MAX_JOBS="4", TORCH_CUDA_ARCH_LIST="9.0a"
     )

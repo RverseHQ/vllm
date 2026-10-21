@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from transformers import Qwen3NextConfig
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
@@ -22,6 +23,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
     FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
 )
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.qwen_fp8_output import (
+    qwen_attention_fp8_output,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
@@ -610,6 +614,32 @@ class Qwen3NextAttention(nn.Module):
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        if envs.VLLM_QWEN_FA3_FP8_OUTPUT:
+            output_kernel = getattr(self.o_proj.quant_method, "fp8_linear", None)
+            if (
+                gate is not None
+                and q.dtype == torch.bfloat16
+                and self.o_proj.tp_size == 1
+                and not self.o_proj.has_bias
+                and self.num_heads == 24
+                and self.head_dim == 256
+                and isinstance(
+                    output_kernel, FlashInferFp8DeepGEMMDynamicBlockScaledKernel
+                )
+                and output_kernel.weight_group_shape.col == 128
+                and output_kernel.fallback.use_deep_gemm_e8m0
+                and output_kernel.uses_deep_gemm(q.shape[0])
+                and current_platform.is_device_capability(90)
+            ):
+                q_output, output_scale = qwen_attention_fp8_output(
+                    q, k, v, gate, self.attn.layer_name
+                )
+                return output_kernel.apply_prequantized_mm(
+                    q_output,
+                    output_scale,
+                    self.o_proj.weight,
+                    self.o_proj.weight_scale_inv,
+                )
         attn_output = self.attn(q, k, v)
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)

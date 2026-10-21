@@ -43,6 +43,12 @@ if _fp8_q4_library:
     torch.ops.load_library(_fp8_q4_library)
     _FP8_Q4_FWD = torch.ops._qwen_q4_m64_C.fwd
 
+_FP8_Q4_GATE_QUANT_FWD = None
+_fp8_q4_gate_quant_library = os.environ.get("QWEN_MAIN237_FA3_Q4_GATE_QUANT_LIBRARY")
+if _fp8_q4_gate_quant_library:
+    torch.ops.load_library(_fp8_q4_gate_quant_library)
+    _FP8_Q4_GATE_QUANT_FWD = torch.ops._qwen_q4_gate_quant_C.fwd_gate_quant
+
 
 try:
     _cute_interface_path = os.path.join(
@@ -184,6 +190,72 @@ def get_scheduler_metadata(
     )
 
     return scheduler_metadata
+
+
+def flash_attn_varlen_q4_gate_quant(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    q_output: torch.Tensor,
+    output_scale: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    block_table: torch.Tensor,
+    softmax_scale: float,
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    scheduler_metadata: torch.Tensor | None,
+    num_splits: int,
+) -> bool:
+    """Try the independent Q4 split final-combine ABI.
+
+    Explicit split=1 and auto splitting keep the original BF16 attention path.
+    Per-sequence dynamic split=1 within an explicit split launch is handled by
+    combine, reading the final BF16 epilogue output rather than a partial.
+    """
+    if not (
+        _FP8_TWO_LEVEL_FWD is not None
+        and _FP8_Q4_FWD is not None
+        and _FP8_Q4_GATE_QUANT_FWD is not None
+        and num_splits > 1
+        and q.is_cuda
+        and q.ndim == 3
+        and q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+        and q.shape[-2:] == (24, 256)
+        and k.ndim == v.ndim == 4
+        and k.shape[-2:] == v.shape[-2:] == (4, 256)
+        and max_seqlen_q == 4
+        and k.shape[1] == v.shape[1] == 1600
+        and k.stride() == v.stride() == (3276800, 2048, 512, 1)
+        and cu_seqlens_q.numel() - 1 <= 992
+        and torch.cuda.get_device_capability(q.device) == (9, 0)
+    ):
+        return False
+    _FP8_Q4_GATE_QUANT_FWD(
+        q,
+        k,
+        v,
+        gate,
+        q_output,
+        output_scale,
+        cu_seqlens_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        block_table,
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        scheduler_metadata,
+        num_splits,
+    )
+    return True
 
 
 def flash_attn_varlen_func(
