@@ -437,6 +437,14 @@ def test_gdn_fp8_output_preserves_small_batch_route(rows: int, expected: bool) -
     assert (actual is kernel) == expected
 
 
+def test_gdn_fp8_output_preserves_raw_activation_consumers() -> None:
+    layer = types.SimpleNamespace(
+        tp_size=1,
+        out_proj=types.SimpleNamespace(requires_unquantized_input=True),
+    )
+    assert QwenGatedDeltaNetAttention._gdn_fp8_output_kernel(layer, 192) is None
+
+
 @pytest.mark.parametrize(
     "rows,padding,route",
     [

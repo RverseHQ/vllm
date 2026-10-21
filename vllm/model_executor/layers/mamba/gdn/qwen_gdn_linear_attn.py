@@ -1282,6 +1282,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _gdn_fp8_output_kernel(
         self, num_tokens: int
     ) -> FlashInferFp8DeepGEMMDynamicBlockScaledKernel | None:
+        if getattr(self.out_proj, "requires_unquantized_input", False):
+            return None
         method = self.out_proj.quant_method
         if (
             self.tp_size != 1

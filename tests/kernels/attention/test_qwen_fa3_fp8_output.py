@@ -369,9 +369,12 @@ def test_q4_gate_quant_matches_bf16_rounding_and_projection(hopper, num_splits, 
     assert torch.equal(projection[:n], original_projection[:n])
 
 
-@pytest.mark.parametrize("rows,enabled", [(31, True), (32, False), (32, True)])
-def test_qwen_eager_and_small_batches_keep_bf16_projection(monkeypatch, rows, enabled):
-    """Eager sigmoid rounding and small-batch BF16 inputs must stay unchanged."""
+@pytest.mark.parametrize(
+    "rows,enabled,raw_input",
+    [(31, True, False), (32, False, False), (32, True, False), (32, True, True)],
+)
+def test_qwen_preserves_bf16_projection_routes(monkeypatch, rows, enabled, raw_input):
+    """Keep eager rounding, small batches and raw-activation wrapper contributions."""
     import torch
 
     from vllm.model_executor.models import qwen3_next as model
@@ -379,6 +382,7 @@ def test_qwen_eager_and_small_batches_keep_bf16_projection(monkeypatch, rows, en
     monkeypatch.setattr(model.envs, "VLLM_QWEN_FA3_FP8_OUTPUT", enabled)
     monkeypatch.setattr(model.envs, "VLLM_BATCH_INVARIANT", False)
     monkeypatch.setattr(model.current_platform, "is_device_capability", lambda _: True)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: raw_input)
     monkeypatch.setattr(
         model,
         "qwen_attention_fp8_output",
@@ -404,11 +408,13 @@ def test_qwen_eager_and_small_batches_keep_bf16_projection(monkeypatch, rows, en
     class Projection(torch.nn.Module):
         tp_size = 1
         has_bias = False
-        quant_method = SimpleNamespace(fp8_linear=kernel)
+        requires_unquantized_input = raw_input
+        if not raw_input:
+            quant_method = SimpleNamespace(fp8_linear=kernel)
 
         def forward(self, x):
             assert x.dtype == torch.bfloat16
-            return x, None
+            return x + 1 if raw_input else x, None
 
     attention = object.__new__(model.Qwen3NextAttention)
     torch.nn.Module.__init__(attention)
@@ -423,4 +429,6 @@ def test_qwen_eager_and_small_batches_keep_bf16_projection(monkeypatch, rows, en
     result = attention(torch.arange(rows), q)
     expected = torch.full_like(q, 0.5)
     expected[:, 0] = 232 / 256
+    if raw_input:
+        expected += 1
     assert torch.equal(result, expected)

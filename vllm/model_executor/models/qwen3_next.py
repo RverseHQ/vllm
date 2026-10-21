@@ -620,7 +620,11 @@ class Qwen3NextAttention(nn.Module):
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v, gate = self._project_qkv_gate(qkv, positions)
-        if envs.VLLM_QWEN_FA3_FP8_OUTPUT and torch.compiler.is_compiling():
+        if (
+            envs.VLLM_QWEN_FA3_FP8_OUTPUT
+            and torch.compiler.is_compiling()
+            and not getattr(self.o_proj, "requires_unquantized_input", False)
+        ):
             compilation = get_current_vllm_config().compilation_config
             output_kernel = getattr(self.o_proj.quant_method, "fp8_linear", None)
             if (
