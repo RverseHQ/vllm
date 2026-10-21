@@ -7,6 +7,7 @@
 #include <string>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include "../torch_utils.h"
@@ -147,7 +148,8 @@ __device__ __forceinline__ Sum2 warp_reduce_sum_pair(float x, float y) {
   return {x, y};
 }
 
-template <typename StateT, int ValueHeadsPerKeyHead, bool SigmoidGate>
+template <typename StateT, int ValueHeadsPerKeyHead, bool SigmoidGate,
+          bool Fp8Output>
 __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
     const __nv_bfloat16* __restrict__ mixed_qkv,
     const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
@@ -155,10 +157,10 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
     const int* __restrict__ state_indices, const int* __restrict__ cu_seqlens,
     const int* __restrict__ num_accepted_tokens, StateT* __restrict__ state,
     const __nv_bfloat16* __restrict__ output_gate,
-    const void* __restrict__ norm_weight, __nv_bfloat16* __restrict__ out,
-    int H, int HV, int state_indices_width, int dt_bias_type,
-    bool norm_weight_is_bf16, float scale, float norm_eps,
-    GdnDecodeStrides strides) {
+    const void* __restrict__ norm_weight, void* __restrict__ out,
+    float* __restrict__ out_scales, int64_t scale_stride, int H, int HV,
+    int state_indices_width, int dt_bias_type, bool norm_weight_is_bf16,
+    float scale, float norm_eps, GdnDecodeStrides strides) {
   const int request = blockIdx.x;
   const int value_head = blockIdx.y;
   const int tid = threadIdx.x;
@@ -182,7 +184,14 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
       const int value = linear % kDimV;
       const int64_t out_offset =
           (static_cast<int64_t>(token) * HV + value_head) * kDimV + value;
-      out[out_offset] = __float2bfloat16(0.0f);
+      if constexpr (Fp8Output) {
+        static_cast<__nv_fp8_e4m3*>(out)[out_offset] = __nv_fp8_e4m3(0.0f);
+        if (value == 0) {
+          out_scales[value_head * scale_stride + token] = 0x1p-33f;
+        }
+      } else {
+        static_cast<__nv_bfloat16*>(out)[out_offset] = __float2bfloat16(0.0f);
+      }
     }
     return;
   }
@@ -352,6 +361,8 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
     const float rstd =
         rsqrtf(sum_square / static_cast<float>(kDimV) + norm_eps);
     const int token = bos + t;
+    float normalized[4];
+    float absmax = 1.0e-10f;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int value = lane + i * 32;
@@ -365,15 +376,45 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
               ? __bfloat162float(
                     static_cast<const __nv_bfloat16*>(norm_weight)[value])
               : static_cast<const float*>(norm_weight)[value];
-      const int64_t out_offset =
-          (static_cast<int64_t>(token) * HV + value_head) * kDimV + value;
-      out[out_offset] =
-          __float2bfloat16(output_values[i] * rstd * weight * gate);
+      if constexpr (Fp8Output) {
+        // Keep the original BF16 rounding point before group quantization.
+        normalized[i] = __bfloat162float(
+            __float2bfloat16(output_values[i] * rstd * weight * gate));
+        absmax = fmaxf(absmax, fabsf(normalized[i]));
+      } else {
+        const int64_t out_offset =
+            (static_cast<int64_t>(token) * HV + value_head) * kDimV + value;
+        static_cast<__nv_bfloat16*>(out)[out_offset] =
+            __float2bfloat16(output_values[i] * rstd * weight * gate);
+      }
+    }
+    if constexpr (Fp8Output) {
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, offset));
+      }
+      const float raw = fmaxf(__fdiv_rn(absmax, 448.0f), 1.0e-10f);
+      const uint32_t bits = __float_as_uint(raw);
+      const float group_scale = __uint_as_float(
+          (((bits >> 23) & 0xffu) + ((bits & 0x7fffffu) != 0u)) << 23);
+      if (lane == 0) {
+        out_scales[value_head * scale_stride + token] = group_scale;
+      }
+      const float inv_scale = 1.0f / group_scale;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int value = lane + i * 32;
+        const int64_t out_offset =
+            (static_cast<int64_t>(token) * HV + value_head) * kDimV + value;
+        static_cast<__nv_fp8_e4m3*>(out)[out_offset] = __nv_fp8_e4m3(
+            fminf(fmaxf(normalized[i] * inv_scale, -448.0f), 448.0f));
+      }
     }
   }
 }
 
-template <typename StateT, int ValueHeadsPerKeyHead, bool SigmoidGate>
+template <typename StateT, int ValueHeadsPerKeyHead, bool SigmoidGate,
+          bool Fp8Output>
 void launch_gdn_decode_post_conv_mtp(
     torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a_log,
     torch::stable::Tensor const& dt_bias,
@@ -383,7 +424,8 @@ void launch_gdn_decode_post_conv_mtp(
     torch::stable::Tensor& state, torch::stable::Tensor const& norm_weight,
     torch::stable::Tensor& out, const __nv_bfloat16* a, const __nv_bfloat16* b,
     const __nv_bfloat16* output_gate, int num_key_heads, int num_value_heads,
-    double scale, double norm_eps, GdnDecodeStrides strides) {
+    double scale, double norm_eps, GdnDecodeStrides strides,
+    torch::stable::Tensor* out_scales) {
   using torch::headeronly::ScalarType;
 
   const auto dt_bias_scalar_type = dt_bias.scalar_type();
@@ -398,19 +440,21 @@ void launch_gdn_decode_post_conv_mtp(
       get_current_cuda_stream(mixed_qkv.get_device_index());
   const int num_requests = static_cast<int>(state_indices.size(0));
   const dim3 grid(num_requests, num_value_heads);
-  gdn_decode_post_conv_mtp_kernel<StateT, ValueHeadsPerKeyHead, SigmoidGate>
-      <<<grid, kThreads, 0, stream>>>(
-          static_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr()), a, b,
-          static_cast<const float*>(a_log.data_ptr()), dt_bias.data_ptr(),
-          static_cast<const int*>(state_indices.data_ptr()),
-          static_cast<const int*>(cu_seqlens.data_ptr()),
-          static_cast<const int*>(num_accepted_tokens.data_ptr()),
-          static_cast<StateT*>(state.data_ptr()), output_gate,
-          norm_weight.data_ptr(), static_cast<__nv_bfloat16*>(out.data_ptr()),
-          num_key_heads, num_value_heads,
-          static_cast<int>(state_indices.size(1)), dt_bias_type,
-          norm_weight.scalar_type() == ScalarType::BFloat16,
-          static_cast<float>(scale), static_cast<float>(norm_eps), strides);
+  gdn_decode_post_conv_mtp_kernel<StateT, ValueHeadsPerKeyHead, SigmoidGate,
+                                  Fp8Output><<<grid, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr()), a, b,
+      static_cast<const float*>(a_log.data_ptr()), dt_bias.data_ptr(),
+      static_cast<const int*>(state_indices.data_ptr()),
+      static_cast<const int*>(cu_seqlens.data_ptr()),
+      static_cast<const int*>(num_accepted_tokens.data_ptr()),
+      static_cast<StateT*>(state.data_ptr()), output_gate,
+      norm_weight.data_ptr(), out.data_ptr(),
+      out_scales == nullptr ? nullptr
+                            : static_cast<float*>(out_scales->data_ptr()),
+      out_scales == nullptr ? 0 : out_scales->stride(1), num_key_heads,
+      num_value_heads, static_cast<int>(state_indices.size(1)), dt_bias_type,
+      norm_weight.scalar_type() == ScalarType::BFloat16,
+      static_cast<float>(scale), static_cast<float>(norm_eps), strides);
   const cudaError_t error = cudaGetLastError();
   STD_TORCH_CHECK(error == cudaSuccess,
                   "GDN decode MTP post-conv kernel launch failed: ",
@@ -419,7 +463,7 @@ void launch_gdn_decode_post_conv_mtp(
 
 }  // namespace
 
-void fused_gdn_decode_post_conv_mtp(
+static void fused_gdn_decode_post_conv_mtp_impl(
     torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a,
     torch::stable::Tensor const& b, torch::stable::Tensor const& a_log,
     torch::stable::Tensor const& dt_bias,
@@ -428,7 +472,8 @@ void fused_gdn_decode_post_conv_mtp(
     torch::stable::Tensor const& num_accepted_tokens,
     torch::stable::Tensor& state, torch::stable::Tensor const& output_gate,
     torch::stable::Tensor const& norm_weight, torch::stable::Tensor& out,
-    double scale, double norm_eps, const std::string& output_gate_activation) {
+    double scale, double norm_eps, const std::string& output_gate_activation,
+    torch::stable::Tensor* out_scales) {
   using torch::headeronly::ScalarType;
 
   STD_TORCH_CHECK(
@@ -467,8 +512,11 @@ void fused_gdn_decode_post_conv_mtp(
                       (norm_weight.scalar_type() == ScalarType::Float ||
                        norm_weight.scalar_type() == ScalarType::BFloat16),
                   "norm_weight must be a CUDA float32 or bfloat16 tensor");
-  STD_TORCH_CHECK(out.is_cuda() && out.scalar_type() == ScalarType::BFloat16,
-                  "out must be a CUDA bfloat16 tensor");
+  STD_TORCH_CHECK(
+      out.is_cuda() && out.scalar_type() == (out_scales == nullptr
+                                                 ? ScalarType::BFloat16
+                                                 : ScalarType::Float8_e4m3fn),
+      "out must be CUDA BF16, or FP8 E4M3 when out_scales is provided");
   STD_TORCH_CHECK(
       output_gate_activation == "silu" || output_gate_activation == "sigmoid",
       "output_gate_activation must be 'silu' or 'sigmoid'");
@@ -546,6 +594,15 @@ void fused_gdn_decode_post_conv_mtp(
                   "output_gate head rows must be contiguous");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   STD_TORCH_CHECK(norm_eps >= 0.0, "norm_eps must be non-negative");
+  if (out_scales != nullptr) {
+    STD_TORCH_CHECK(
+        out_scales->is_cuda() &&
+            out_scales->scalar_type() == ScalarType::Float &&
+            out_scales->dim() == 2 && out_scales->size(0) == num_tokens &&
+            out_scales->size(1) == num_value_heads &&
+            out_scales->stride(0) == 1 && out_scales->stride(1) >= num_tokens,
+        "out_scales must be FP32 column-major [L, HV]");
+  }
 
   const GdnDecodeStrides strides{mixed_qkv.stride(0), a.stride(0), b.stride(0),
                                  output_gate.stride(0), state.stride(0)};
@@ -553,14 +610,22 @@ void fused_gdn_decode_post_conv_mtp(
   const auto* b_ptr = static_cast<const __nv_bfloat16*>(b.data_ptr());
   const auto* output_gate_ptr =
       static_cast<const __nv_bfloat16*>(output_gate.data_ptr());
-  const auto launch = [&]<typename StateT, int ValueHeadsPerKeyHead,
-                          bool SigmoidGate>() {
-    launch_gdn_decode_post_conv_mtp<StateT, ValueHeadsPerKeyHead, SigmoidGate>(
-        mixed_qkv, a_log, dt_bias, state_indices, cu_seqlens,
-        num_accepted_tokens, state, norm_weight, out, a_ptr, b_ptr,
-        output_gate_ptr, num_key_heads, num_value_heads, scale, norm_eps,
-        strides);
-  };
+  const auto launch =
+      [&]<typename StateT, int ValueHeadsPerKeyHead, bool SigmoidGate>() {
+        const auto launch_output = [&]<bool Fp8Output>() {
+          launch_gdn_decode_post_conv_mtp<StateT, ValueHeadsPerKeyHead,
+                                          SigmoidGate, Fp8Output>(
+              mixed_qkv, a_log, dt_bias, state_indices, cu_seqlens,
+              num_accepted_tokens, state, norm_weight, out, a_ptr, b_ptr,
+              output_gate_ptr, num_key_heads, num_value_heads, scale, norm_eps,
+              strides, out_scales);
+        };
+        if (out_scales == nullptr) {
+          launch_output.template operator()<false>();
+        } else {
+          launch_output.template operator()<true>();
+        }
+      };
   const auto dispatch_state_type = [&]<int ValueHeadsPerKeyHead>() {
     if (state_scalar_type == ScalarType::Float) {
       if (output_gate_activation == "sigmoid") {
@@ -594,4 +659,37 @@ void fused_gdn_decode_post_conv_mtp(
       dispatch_state_type.template operator()<8>();
       break;
   }
+}
+
+void fused_gdn_decode_post_conv_mtp(
+    torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b, torch::stable::Tensor const& a_log,
+    torch::stable::Tensor const& dt_bias,
+    torch::stable::Tensor const& state_indices,
+    torch::stable::Tensor const& cu_seqlens,
+    torch::stable::Tensor const& num_accepted_tokens,
+    torch::stable::Tensor& state, torch::stable::Tensor const& output_gate,
+    torch::stable::Tensor const& norm_weight, torch::stable::Tensor& out,
+    double scale, double norm_eps, const std::string& output_gate_activation) {
+  fused_gdn_decode_post_conv_mtp_impl(
+      mixed_qkv, a, b, a_log, dt_bias, state_indices, cu_seqlens,
+      num_accepted_tokens, state, output_gate, norm_weight, out, scale,
+      norm_eps, output_gate_activation, nullptr);
+}
+
+void fused_gdn_decode_post_conv_mtp_fp8(
+    torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b, torch::stable::Tensor const& a_log,
+    torch::stable::Tensor const& dt_bias,
+    torch::stable::Tensor const& state_indices,
+    torch::stable::Tensor const& cu_seqlens,
+    torch::stable::Tensor const& num_accepted_tokens,
+    torch::stable::Tensor& state, torch::stable::Tensor const& output_gate,
+    torch::stable::Tensor const& norm_weight, torch::stable::Tensor& out,
+    torch::stable::Tensor& out_scales, double scale, double norm_eps,
+    const std::string& output_gate_activation) {
+  fused_gdn_decode_post_conv_mtp_impl(
+      mixed_qkv, a, b, a_log, dt_bias, state_indices, cu_seqlens,
+      num_accepted_tokens, state, output_gate, norm_weight, out, scale,
+      norm_eps, output_gate_activation, &out_scales);
 }

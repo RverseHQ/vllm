@@ -555,6 +555,13 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor! state, Tensor output_gate, Tensor norm_weight, Tensor! out, "
       "float scale, float norm_eps=1e-5, "
       "str output_gate_activation='silu') -> ()");
+  ops.def(
+      "fused_gdn_decode_post_conv_mtp_fp8("
+      "Tensor mixed_qkv, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, "
+      "Tensor state_indices, Tensor cu_seqlens, Tensor num_accepted_tokens, "
+      "Tensor! state, Tensor output_gate, Tensor norm_weight, Tensor! out, "
+      "Tensor! out_scales, float scale, float norm_eps=1e-5, "
+      "str output_gate_activation='silu') -> ()");
 #endif
 
 #ifdef VLLM_ENABLE_FUSED_KDA_CHUNK
@@ -867,6 +874,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 #ifdef VLLM_ENABLE_FUSED_GDN_DECODE
   ops.impl("fused_gdn_decode_post_conv_mtp",
            TORCH_BOX(&fused_gdn_decode_post_conv_mtp));
+  ops.impl("fused_gdn_decode_post_conv_mtp_fp8",
+           TORCH_BOX(&fused_gdn_decode_post_conv_mtp_fp8));
 #endif
 
 #ifdef VLLM_ENABLE_FUSED_KDA_CHUNK

@@ -120,6 +120,8 @@ def _build_layer(
         norm=_TestGatedNorm(norm_weight, output_gate_activation),
         layer_norm_epsilon=EPS,
         gdn_decode_kernel="cuda",
+        use_gdn_recovery=False,
+        num_spec=NUM_SPEC,
     )
     with set_current_vllm_config(vllm_config):
         layer.chunk_gated_delta_rule = ChunkGatedDeltaRule()
@@ -132,6 +134,9 @@ def _build_layer(
         "_rms_norm_gated_cuda",
         "_forward_core_fused_norm",
         "_forward_core_fused_norm_packed",
+        "_forward_core_fused_norm_fp8_packed",
+        "_gdn_fp8_output_kernel",
+        "forward_cuda",
         "split_ba",
     ):
         setattr(
@@ -390,3 +395,190 @@ def test_fused_model_path_matches_reference(
         atol=3e-2,
         rtol=3e-2,
     )
+
+
+@pytest.mark.parametrize("rows,padding", [(32, 0), (32, 4), (192, 0), (192, 4)])
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+@pytest.mark.parametrize("norm_dtype", [torch.bfloat16, torch.float32])
+def test_native_fp8_output_matches_official_quantizer(
+    rows: int, padding: int, activation: str, norm_dtype: torch.dtype
+) -> None:
+    """Fusion preserves BF16 rounding, column scales and every FP32 state byte."""
+    if not current_platform.has_device_capability(89):
+        pytest.skip("FP8 conversion probe requires compute capability 8.9+")
+    if not hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp_fp8"):
+        pytest.skip("fused GDN FP8 output op is not built")
+    from benchmarks.kernels.benchmark_gdn_fp8_output import check_native_output
+
+    check_native_output(rows, padding, activation, norm_dtype, installed=True)
+
+
+@pytest.mark.parametrize(
+    "rows,expected", [(4, False), (31, False), (32, True), (192, True)]
+)
+def test_gdn_fp8_output_preserves_small_batch_route(rows: int, expected: bool) -> None:
+    """Only the existing group128/E8M0 DeepGEMM branch can consume fused output."""
+    if not hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp_fp8"):
+        pytest.skip("fused GDN FP8 output op is not built")
+    kernel_type = qwen_gdn_linear_attn.FlashInferFp8DeepGEMMDynamicBlockScaledKernel
+    kernel = object.__new__(kernel_type)
+    kernel.weight_group_shape = types.SimpleNamespace(col=128)
+    kernel.fallback = types.SimpleNamespace(use_deep_gemm_e8m0=True)
+    method = object.__new__(qwen_gdn_linear_attn.Fp8LinearMethod)
+    method.fp8_linear = kernel
+    layer = types.SimpleNamespace(
+        tp_size=1, out_proj=types.SimpleNamespace(quant_method=method, bias=None)
+    )
+    with (
+        patch.object(current_platform, "has_device_capability", return_value=True),
+        patch.object(qwen_gdn_linear_attn.envs, "VLLM_BATCH_INVARIANT", False),
+    ):
+        actual = QwenGatedDeltaNetAttention._gdn_fp8_output_kernel(layer, rows)
+    assert (actual is kernel) == expected
+
+
+@pytest.mark.parametrize(
+    "rows,padding,route",
+    [
+        (32, 0, "native"),
+        (192, 4, "native"),
+        (64, 0, "mixed"),
+        (64, 0, "prefill"),
+        (32, 0, "bf16-state"),
+    ],
+)
+@torch.inference_mode()
+def test_fp8_model_path_matches_native_projection(
+    rows: int, padding: int, route: str
+) -> None:
+    """The enabled model consumer matches native BF16 + official DeepGEMM."""
+    if not current_platform.has_device_capability(90):
+        pytest.skip("The production DeepGEMM projection requires SM90+")
+    if not hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp_fp8"):
+        pytest.skip("fused GDN FP8 output op is not built")
+    from benchmarks.kernels.benchmark_gdn_fp8_output import assert_bytes_equal
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+
+    torch.manual_seed(73)
+    device = torch.device("cuda")
+    actual = rows - padding
+    requests = actual // SPEC_TOKENS
+    config = _make_vllm_config()
+    builder = GDNAttentionMetadataBuilder(
+        kv_cache_spec=MambaSpec(
+            block_size=BLOCK_SIZE,
+            shapes=((16, 64),),
+            dtypes=(torch.float16,),
+            num_speculative_blocks=NUM_SPEC,
+        ),
+        layer_names=[PREFIX],
+        vllm_config=config,
+        device=device,
+    )
+    if route == "mixed":
+        query_lens = [SPEC_TOKENS] * (requests // 2) + [actual // 2]
+        drafts = [NUM_SPEC] * (requests // 2) + [-1]
+    elif route == "prefill":
+        query_lens, drafts = [actual], [-1]
+    else:
+        query_lens, drafts = [SPEC_TOKENS] * requests, [NUM_SPEC] * requests
+    batch = BatchSpec(seq_lens=[128] * len(query_lens), query_lens=query_lens)
+    common = create_common_attn_metadata(
+        batch, BLOCK_SIZE, device, arange_block_indices=True
+    )
+    common.block_table_tensor.add_(1)
+    with set_current_vllm_config(config):
+        metadata = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common,
+            num_accepted_tokens=torch.ones(
+                len(query_lens), dtype=torch.int32, device=device
+            ),
+            num_decode_draft_tokens_cpu=torch.tensor(drafts, dtype=torch.int32),
+        )
+    indices = [
+        tensor
+        for tensor in (
+            metadata.spec_state_indices_tensor,
+            metadata.non_spec_state_indices_tensor,
+        )
+        if tensor is not None and tensor.numel()
+    ]
+    slots = max(int(tensor.max().item()) for tensor in indices) + 1
+    conv_shape, state_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
+        1, H, HV, K, V, CONV_KERNEL, NUM_SPEC
+    )
+    conv = torch.randn(slots, *conv_shape, dtype=torch.bfloat16, device=device) * 0.05
+    state_dtype = torch.bfloat16 if route == "bf16-state" else torch.float32
+    state = torch.randn(slots, *state_shape, dtype=state_dtype, device=device) * 0.01
+    a_log, bias = torch.randn(2, HV, device=device) * 0.1
+    conv_weight = (
+        torch.randn(CONV_DIM, 1, CONV_KERNEL, dtype=torch.bfloat16, device=device) * 0.1
+    )
+    norm = torch.randn(V, device=device)
+    qkvz = (
+        torch.randn(rows, CONV_DIM + HV * V, dtype=torch.bfloat16, device=device) * 0.1
+    )
+    ba = torch.randn(rows, 2 * HV, dtype=torch.bfloat16, device=device) * 0.1
+    hidden = torch.empty(rows, 1, dtype=torch.bfloat16, device=device)
+
+    kernel_type = qwen_gdn_linear_attn.FlashInferFp8DeepGEMMDynamicBlockScaledKernel
+    kernel = object.__new__(kernel_type)
+    kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
+    kernel.weight_group_shape = types.SimpleNamespace(col=128)
+    kernel.fallback = types.SimpleNamespace(use_deep_gemm_e8m0=True)
+    method = object.__new__(qwen_gdn_linear_attn.Fp8LinearMethod)
+    method.fp8_linear = kernel
+    weight, weight_scale = deepgemm_post_process_fp8_weight_block(
+        wq=(torch.randn(128, HV * V, device=device) * 0.1).to(torch.float8_e4m3fn),
+        ws=torch.ones(1, HV, device=device),
+        quant_block_shape=(128, 128),
+        use_e8m0=True,
+    )
+
+    class Projection:
+        bias = None
+        output_size = 128
+        quant_method = method
+        weight_scale_inv = weight_scale
+
+        def __init__(self):
+            self.weight = weight
+
+        def __call__(self, x):
+            return kernel.apply_weights(self, x), None
+
+    outputs, states, conv_states = [], [], []
+    for enabled in (False, True):
+        layer = _build_layer(
+            config, conv.clone(), state.clone(), a_log, bias, conv_weight, norm, "silu"
+        )
+        layer.enable_fused_gdn_spec_decode = True
+        layer.in_proj_qkvz = lambda _: (qkvz.clone(), None)
+        layer.in_proj_ba = lambda _: (ba, None)
+        layer.out_proj = Projection()
+        context = types.SimpleNamespace(
+            attn_metadata={PREFIX: metadata}, no_compile_layers={PREFIX: layer}
+        )
+        with (
+            patch.object(
+                qwen_gdn_linear_attn, "get_forward_context", return_value=context
+            ),
+            patch.object(
+                qwen_gdn_linear_attn.envs, "VLLM_QWEN_GDN_FP8_OUTPUT", enabled
+            ),
+            patch.object(
+                qwen_gdn_linear_attn.ops,
+                "fused_gdn_decode_post_conv_mtp_fp8",
+                wraps=qwen_gdn_linear_attn.ops.fused_gdn_decode_post_conv_mtp_fp8,
+            ) as fused,
+        ):
+            outputs.append(layer.forward_cuda(hidden))
+        assert fused.call_count == int(enabled and route == "native")
+        states.append(layer.kv_cache[1])
+        conv_states.append(layer.kv_cache[0])
+    assert_bytes_equal(outputs[1], outputs[0])
+    assert_bytes_equal(states[1], states[0])
+    assert_bytes_equal(conv_states[1], conv_states[0])

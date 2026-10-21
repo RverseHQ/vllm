@@ -2885,6 +2885,45 @@ def fused_gdn_decode_post_conv_mtp(
     return out
 
 
+def fused_gdn_decode_post_conv_mtp_fp8(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    out: torch.Tensor,
+    out_scales: torch.Tensor,
+    scale: float = 128**-0.5,
+    norm_eps: float = 1e-5,
+    output_gate_activation: str = "silu",
+) -> None:
+    """Native GDN with BF16-rounded FP8 output and group128 FP32 scales."""
+    torch.ops._C.fused_gdn_decode_post_conv_mtp_fp8(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state_indices,
+        cu_seqlens,
+        num_accepted_tokens,
+        state,
+        output_gate,
+        norm_weight,
+        out,
+        out_scales,
+        scale,
+        norm_eps,
+        output_gate_activation,
+    )
+
+
 def concat_and_cache_mla(
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,
