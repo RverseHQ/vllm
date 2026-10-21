@@ -184,8 +184,6 @@ extern "C" int launch_gate_helper(void const* a, void const* g, void* q,
             f"-I{ROOT / 'tools/flash_attn_fp8'}",
         ],
         check=True,
-        capture_output=True,
-        text=True,
     )
     launch = ctypes.CDLL(str(library)).launch_gate_helper
     launch.argtypes = [
@@ -205,6 +203,10 @@ extern "C" int launch_gate_helper(void const* a, void const* g, void* q,
     # Distinguish the native CUDA epsilon contract from the Triton pre-clamp.
     attention[0] = 0
     attention[1] *= 1e-11
+    attention[2] = 0
+    gate[2] = 64
+    attention[2, 0], gate[2, 0] = 187 / 128, 0.5
+    attention[2, 1] = 128
     quant = torch.empty_like(attention, dtype=torch.float8_e4m3fn)
     scale = torch.empty(columns // 128, rows, device="cuda", dtype=torch.float32).t()
     assert (
@@ -230,6 +232,52 @@ extern "C" int launch_gate_helper(void const* a, void const* g, void* q,
     )
     assert torch.equal(scale, expected_scale)
     assert torch.equal(quant.view(torch.uint8), expected_q.view(torch.uint8))
+
+
+def test_bf16_fallback_matches_native_quantization_with_padding():
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from vllm.model_executor.layers.attention.qwen_fp8_output import (
+        gate_quant_bf16_attention,
+    )
+
+    rows, columns, actual = 64, 6144, 63
+    generator = torch.Generator(device="cuda").manual_seed(41)
+    attention = torch.randn(
+        rows, columns, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    gate = (
+        torch.randn(
+            rows, columns, dtype=torch.bfloat16, device="cuda", generator=generator
+        )
+        * 8
+    )
+    attention[0] = 0
+    attention[1] *= 1e-11
+    attention[2] = 7
+    gate[2] = 64
+    attention[3] = 0
+    gate[3] = 64
+    attention[3, 0], gate[3, 0] = 187 / 128, 0.5
+    attention[3, 1] = 128
+    product = _captured_gate_product(attention[:actual], gate[:actual])
+    expected_q = torch.empty_like(product, dtype=torch.float8_e4m3fn)
+    expected_scale = torch.empty(
+        columns // 128, actual, dtype=torch.float32, device="cuda"
+    ).t()
+    torch.ops._C.per_token_group_fp8_quant(
+        product, expected_q, expected_scale, 128, 1e-10, -448, 448, True, True, False
+    )
+    quant = torch.empty_like(attention, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(columns // 128, rows, dtype=torch.float32, device="cuda").t()
+    gate_quant_bf16_attention(attention, gate, quant, scale, actual)
+    assert torch.equal(quant[:actual].view(torch.uint8), expected_q.view(torch.uint8))
+    assert torch.equal(scale[:actual], expected_scale)
+    assert quant[3, 0].float().item() == 1.875
+    assert quant[actual:].view(torch.uint8).count_nonzero().item() == 0
+    assert scale[actual:].count_nonzero().item() == 0
 
 
 @pytest.mark.parametrize("num_splits", [1, 2, 0], ids=["single", "combine", "auto"])
@@ -321,19 +369,24 @@ def test_q4_gate_quant_matches_bf16_rounding_and_projection(hopper, num_splits, 
     assert torch.equal(projection[:n], original_projection[:n])
 
 
-@pytest.mark.parametrize("rows,enabled", [(31, True), (32, False)])
-def test_qwen_small_batches_and_default_flag_keep_bf16_projection(
-    monkeypatch, rows, enabled
-):
-    """The model's existing M<32 FlashInfer BF16 input must not be prequantized."""
+@pytest.mark.parametrize("rows,enabled", [(31, True), (32, False), (32, True)])
+def test_qwen_eager_and_small_batches_keep_bf16_projection(monkeypatch, rows, enabled):
+    """Eager sigmoid rounding and small-batch BF16 inputs must stay unchanged."""
     import torch
 
     from vllm.model_executor.models import qwen3_next as model
 
     monkeypatch.setattr(model.envs, "VLLM_QWEN_FA3_FP8_OUTPUT", enabled)
     monkeypatch.setattr(model.envs, "VLLM_BATCH_INVARIANT", False)
+    monkeypatch.setattr(model.current_platform, "is_device_capability", lambda _: True)
+    monkeypatch.setattr(
+        model,
+        "qwen_attention_fp8_output",
+        lambda *args: pytest.fail("eager attention must not use the compiled gate ABI"),
+    )
     q = torch.ones(rows, 6144, dtype=torch.bfloat16)
     gate = torch.zeros_like(q)
+    q[:, 0], gate[:, 0] = 187 / 128, 0.5
     kernel = _projection_kernel(torch)
 
     class QKV(torch.nn.Module):
@@ -343,6 +396,8 @@ def test_qwen_small_batches_and_default_flag_keep_bf16_projection(
             return x, None
 
     class Attention(torch.nn.Module):
+        layer_name = "attention"
+
         def forward(self, q, k, v):
             return q
 
@@ -366,4 +421,6 @@ def test_qwen_small_batches_and_default_flag_keep_bf16_projection(
     )
     monkeypatch.setattr(attention, "_project_qkv_gate", lambda *args: (q, q, q, gate))
     result = attention(torch.arange(rows), q)
-    assert torch.equal(result, torch.full_like(q, 0.5))
+    expected = torch.full_like(q, 0.5)
+    expected[:, 0] = 232 / 256
+    assert torch.equal(result, expected)

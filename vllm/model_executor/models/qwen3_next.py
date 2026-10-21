@@ -11,7 +11,13 @@ from transformers import Qwen3NextConfig
 
 import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    VllmConfig,
+    get_current_vllm_config,
+)
+from vllm.config.compilation import CompilationMode
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -614,10 +620,13 @@ class Qwen3NextAttention(nn.Module):
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v, gate = self._project_qkv_gate(qkv, positions)
-        if envs.VLLM_QWEN_FA3_FP8_OUTPUT:
+        if envs.VLLM_QWEN_FA3_FP8_OUTPUT and torch.compiler.is_compiling():
+            compilation = get_current_vllm_config().compilation_config
             output_kernel = getattr(self.o_proj.quant_method, "fp8_linear", None)
             if (
-                gate is not None
+                compilation.mode == CompilationMode.VLLM_COMPILE
+                and compilation.backend in ("", "inductor")
+                and gate is not None
                 and q.dtype == torch.bfloat16
                 and self.o_proj.tp_size == 1
                 and not self.o_proj.has_bias
