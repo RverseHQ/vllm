@@ -75,10 +75,16 @@ def build_probe(build_dir: Path) -> None:
             name=f"qwen_gdn_fp8_probe_{name}",
             sources=[str(cpp), str(ROOT / source)],
             extra_include_paths=includes,
-            extra_cflags=["-O3", "-std=c++20", "-DVLLM_ENABLE_FUSED_GDN_DECODE"],
+            extra_cflags=[
+                "-O3",
+                "-std=c++20",
+                "-DUSE_CUDA",
+                "-DVLLM_ENABLE_FUSED_GDN_DECODE",
+            ],
             extra_cuda_cflags=[
                 "-O3",
                 "-std=c++20",
+                "-DUSE_CUDA",
                 "--expt-extended-lambda",
                 "--expt-relaxed-constexpr",
                 "-DVLLM_ENABLE_FUSED_GDN_DECODE",
@@ -110,6 +116,7 @@ def check_native_output(
     *,
     installed: bool = False,
     check_reference: bool = False,
+    query_lens: list[int] | None = None,
 ) -> None:
     """Compare to the old native BF16 output plus official native quantizer."""
     namespace = torch.ops._C if installed else torch.ops.qwen_gdn_probe
@@ -125,8 +132,12 @@ def check_native_output(
     torch.manual_seed(71)
     h, hv, dim, mtp = 1, 8, 128, 4
     actual_rows = rows - padding
-    assert actual_rows % mtp == 0
-    requests = actual_rows // mtp
+    ragged = query_lens is not None
+    if query_lens is None:
+        assert actual_rows % mtp == 0
+        query_lens = [mtp] * (actual_rows // mtp)
+    assert sum(query_lens) == actual_rows and all(0 <= n <= mtp for n in query_lens)
+    requests = len(query_lens)
     device = "cuda"
     qkv = (
         torch.randn(
@@ -141,13 +152,15 @@ def check_native_output(
     gate = torch.randn(actual_rows, hv, dim, dtype=torch.bfloat16, device=device)
     norm = torch.randn(dim, dtype=norm_dtype, device=device)
     indices = torch.arange(
-        1, actual_rows + 1, device=device, dtype=torch.int32
+        1, requests * mtp + 1, device=device, dtype=torch.int32
     ).reshape(requests, mtp)
     # A padded request with no source must emit official quantized zero rows.
     indices[-1].zero_()
-    cu = torch.arange(0, actual_rows + 1, mtp, dtype=torch.int32, device=device)
+    cu = torch.tensor([0, *query_lens], dtype=torch.int32, device=device).cumsum(
+        0, dtype=torch.int32
+    )
     accepted = torch.arange(requests, dtype=torch.int32, device=device) % mtp + 1
-    seed = torch.randn(actual_rows + 1, hv, dim, dim, device=device) * 0.01
+    seed = torch.randn(requests * mtp + 1, hv, dim, dim, device=device) * 0.01
     reference_state, fused_state = seed.clone(), seed.clone()
     reference = torch.zeros(rows, hv, dim, dtype=torch.bfloat16, device=device)
     fused = torch.zeros(rows, hv, dim, dtype=torch.float8_e4m3fn, device=device)
@@ -216,7 +229,8 @@ def check_native_output(
     assert_bytes_equal(fused_projection, expected_projection)
     torch.accelerator.synchronize()
     print(
-        f"PASS rows={rows} padding={padding} {activation} norm={norm_dtype}: "
+        f"PASS rows={rows} padding={padding} varlen={ragged} "
+        f"{activation} norm={norm_dtype}: "
         "FP8/scales/FP32-state/projection byte-identical"
     )
 
@@ -243,6 +257,14 @@ def main() -> None:
                         norm_dtype,
                         check_reference=args.reference_library is not None,
                     )
+    check_native_output(
+        36,
+        4,
+        "silu",
+        torch.float32,
+        query_lens=[1, 4, 1, 2, 3, 4, 1, 2, 3, 4, 3, 4, 0, 0],
+        check_reference=args.reference_library is not None,
+    )
 
 
 if __name__ == "__main__":
