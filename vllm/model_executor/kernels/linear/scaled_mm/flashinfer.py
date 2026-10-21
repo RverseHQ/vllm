@@ -192,13 +192,15 @@ class FlashInferFp8DeepGEMMDynamicBlockScaledKernel(
         input_scale: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Project a producer's FP8 values with the existing DeepGEMM kernel."""
-        output = torch.empty(
-            (q_input.shape[0], weight.shape[0]),
-            dtype=self.config.out_dtype,
-            device=q_input.device,
-        )
+        if output is None:
+            output = torch.empty(
+                (q_input.shape[0], weight.shape[0]),
+                dtype=self.config.out_dtype,
+                device=q_input.device,
+            )
         torch.ops.vllm.fp8_gemm_nt_op(
             q_input,
             input_scale,
@@ -208,6 +210,32 @@ class FlashInferFp8DeepGEMMDynamicBlockScaledKernel(
             self.fallback.use_deep_gemm_e8m0,
         )
         return output
+
+    def apply_bf16_mm_into(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Keep the existing batch dispatch while writing a graph-owned output."""
+        if self.uses_deep_gemm(input.shape[0]):
+            _deepgemm_bf16_input(
+                input,
+                weight,
+                weight_scale,
+                self.weight_group_shape.col,
+                self.fallback.use_deep_gemm_e8m0,
+                output,
+            )
+        else:
+            flashinfer_fp8_blockscale_gemm(
+                input=input,
+                weight=weight,
+                weight_scale=weight_scale,
+                out=output,
+                out_dtype=self.config.out_dtype,
+            )
 
     def apply_block_scaled_mm(
         self,
@@ -253,6 +281,35 @@ direct_register_custom_op(
     _flashinfer_fp8_blockscale_gemm_impl,
     fake_impl=_flashinfer_fp8_blockscale_gemm_fake,
 )
+
+
+def _deepgemm_bf16_input(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+    use_deep_gemm_e8m0: bool,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    q_input, input_scale = per_token_group_quant_fp8(
+        input,
+        group_size=group_size,
+        column_major_scales=True,
+        use_ue8m0=use_deep_gemm_e8m0,
+    )
+    if output is None:
+        output = torch.empty(
+            (q_input.shape[0], weight.shape[0]),
+            dtype=torch.bfloat16,
+            device=q_input.device,
+        )
+    fp8_gemm_nt(
+        (q_input, input_scale),
+        (weight, weight_scale),
+        output,
+        is_deep_gemm_e8m0_used=use_deep_gemm_e8m0,
+    )
+    return output
 
 
 def _dynamic_flashinfer_deepgemm_blockscale_gemm_impl(
@@ -305,24 +362,9 @@ def _dynamic_flashinfer_deepgemm_blockscale_gemm_impl(
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
-        q_input, input_scale = per_token_group_quant_fp8(
-            input,
-            group_size=group_size,
-            column_major_scales=True,
-            use_ue8m0=use_deep_gemm_e8m0,
+        return _deepgemm_bf16_input(
+            input, weight, weight_scale, group_size, use_deep_gemm_e8m0
         )
-        output = torch.empty(
-            (q_input.shape[0], weight.shape[0]),
-            dtype=torch.bfloat16,
-            device=q_input.device,
-        )
-        fp8_gemm_nt(
-            (q_input, input_scale),
-            (weight, weight_scale),
-            output,
-            is_deep_gemm_e8m0_used=use_deep_gemm_e8m0,
-        )
-        return output
 
     if envs.VLLM_BATCH_INVARIANT:
         return run_deepgemm(input, weight, weight_scale)

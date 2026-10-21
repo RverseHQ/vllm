@@ -138,6 +138,7 @@ def _build_layer(
         "_forward_core_fused_norm",
         "_forward_core_fused_norm_packed",
         "_forward_core_fused_norm_fp8_packed",
+        "_forward_core_fused_norm_fp8_projected",
         "_gdn_fp8_output_kernel",
         "forward_cuda",
         "split_ba",
@@ -465,20 +466,24 @@ def test_gdn_fp8_output_preserves_raw_activation_consumers() -> None:
 
 
 @pytest.mark.parametrize(
-    "rows,padding,route",
+    "rows,padding,route,cuda_graph",
     [
-        (32, 0, "native"),
-        (192, 4, "native"),
-        (64, 0, "mixed"),
-        (64, 0, "prefill"),
-        (32, 0, "bf16-state"),
+        (4, 0, "native", False),
+        (22, 0, "prefill", False),
+        (4, 0, "native", True),
+        (22, 0, "prefill", True),
+        (32, 0, "native", False),
+        (192, 4, "native", False),
+        (64, 0, "mixed", False),
+        (64, 0, "prefill", False),
+        (32, 0, "bf16-state", False),
     ],
 )
 @torch.inference_mode()
 def test_fp8_model_path_matches_native_projection(
-    rows: int, padding: int, route: str
+    rows: int, padding: int, route: str, cuda_graph: bool
 ) -> None:
-    """The enabled model consumer matches native BF16 + official DeepGEMM."""
+    """The model consumer preserves both small-batch and DeepGEMM projections."""
     if not current_platform.has_device_capability(90):
         pytest.skip("The production DeepGEMM projection requires SM90+")
     if not hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp_fp8"):
@@ -602,10 +607,155 @@ def test_fp8_model_path_matches_native_projection(
                 wraps=qwen_gdn_linear_attn.ops.fused_gdn_decode_post_conv_mtp_fp8,
             ) as fused,
         ):
-            outputs.append(layer.forward_cuda(hidden))
-        assert fused.call_count == int(enabled and route == "native")
+            if cuda_graph:
+                layer.forward_cuda(hidden)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = layer.forward_cuda(hidden)
+                graph.replay()
+                outputs.append(output.clone())
+            else:
+                outputs.append(layer.forward_cuda(hidden))
+        assert fused.call_count == int(enabled and route == "native" and rows >= 32)
         states.append(layer.kv_cache[1])
         conv_states.append(layer.kv_cache[0])
     assert_bytes_equal(outputs[1], outputs[0])
     assert_bytes_equal(states[1], states[0])
     assert_bytes_equal(conv_states[1], conv_states[0])
+
+
+@pytest.mark.parametrize("graph_mode", ["NONE", "PIECEWISE"])
+@torch.inference_mode()
+def test_gdn_output_route_changes_after_compiled_prefill(monkeypatch, graph_mode):
+    """One guard-free vLLM graph must select the decode producer at runtime."""
+    from vllm.compilation.decorators import support_torch_compile
+    from vllm.config import (
+        CompilationConfig,
+        CompilationMode,
+        CUDAGraphMode,
+        VllmConfig,
+    )
+    from vllm.config.scheduler import SchedulerConfig
+    from vllm.forward_context import BatchDescriptor, set_forward_context
+
+    config = VllmConfig(
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            backend="inductor",
+            cudagraph_mode=graph_mode,
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_batched_tokens=256,
+            max_num_seqs=48,
+            max_model_len=256,
+            is_encoder_decoder=False,
+        ),
+    )
+    kernel_type = qwen_gdn_linear_attn.FlashInferFp8DeepGEMMDynamicBlockScaledKernel
+    kernel = object.__new__(kernel_type)
+    kernel.weight_group_shape = types.SimpleNamespace(col=128)
+    kernel.fallback = types.SimpleNamespace(use_deep_gemm_e8m0=True)
+    monkeypatch.setattr(
+        kernel,
+        "apply_prequantized_mm",
+        lambda q, scale, weight, weight_scale, *, output: output.copy_(
+            q.to(torch.bfloat16)
+        ),
+    )
+    monkeypatch.setattr(
+        kernel,
+        "apply_bf16_mm_into",
+        lambda input, weight, weight_scale, output: output.copy_(input),
+    )
+    method = object.__new__(qwen_gdn_linear_attn.Fp8LinearMethod)
+    method.fp8_linear = kernel
+
+    class Projection:
+        quant_method = method
+        bias = None
+        weight = weight_scale_inv = None
+        output_size = 6144
+
+        def __call__(self, x):
+            return x, None
+
+    attributes = types.SimpleNamespace(
+        prefix=PREFIX,
+        enable_fused_gdn_spec_decode=True,
+        norm=types.SimpleNamespace(weight=torch.ones(128, dtype=torch.bfloat16)),
+        in_proj_qkvz=lambda x: (x, None),
+        in_proj_ba=lambda x: (x[:, :96], None),
+        out_proj=Projection(),
+        tp_size=1,
+        num_v_heads=48,
+        head_v_dim=128,
+        _fp8_output_device_supported=True,
+        _max_spec_decode_tokens=192,
+        _forward_core_fused_norm_packed=lambda mixed_qkvz, ba, core_attn_out: (
+            core_attn_out.copy_(mixed_qkvz[:, :6144].reshape_as(core_attn_out) + 1)
+        ),
+        _forward_core_fused_norm_fp8_packed=lambda q, ba, out, scales: (
+            out.copy_(q[:, :6144].reshape_as(out) + 2),
+            scales.fill_(1),
+        ),
+    )
+    layer = object.__new__(QwenGatedDeltaNetAttention)
+    torch.nn.Module.__init__(layer)
+    layer.__dict__.update(vars(attributes))
+    config.compilation_config.static_forward_context[PREFIX] = layer
+    monkeypatch.setenv("VLLM_QWEN_GDN_FP8_OUTPUT", "1")
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
+    monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "0")
+    monkeypatch.setenv("VLLM_USE_BYTECODE_HOOK", "0")
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "true")
+    monkeypatch.setattr(qwen_gdn_linear_attn.envs, "VLLM_BATCH_INVARIANT", False)
+
+    @support_torch_compile(dynamic_arg_dims={"x": 0})
+    class Model(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+
+        def forward(self, x: torch.Tensor):
+            return QwenGatedDeltaNetAttention.forward_cuda(layer, x) + 1
+
+    with (
+        torch.cuda.stream(torch.cuda.Stream()),
+        set_current_vllm_config(config),
+        set_forward_context({}, config),
+    ):
+        model = Model(vllm_config=config).cuda()
+        inputs = {
+            rows: torch.ones(rows, 16384, dtype=torch.bfloat16, device="cuda")
+            for rows in (4, 32, 192, 256)
+        }
+        model(inputs[256])
+        if graph_mode == "PIECEWISE":
+            for rows, x in inputs.items():
+                with set_forward_context(
+                    {},
+                    config,
+                    cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+                    batch_descriptor=BatchDescriptor(num_tokens=rows),
+                ):
+                    model(x)
+        for rows, value, expected in (
+            (256, 1, 3),
+            (32, 1, 4),
+            (32, 2, 5),
+            (4, 1, 3),
+            (192, 1, 4),
+            (256, 3, 5),
+        ):
+            inputs[rows].fill_(value)
+            with set_forward_context(
+                {},
+                config,
+                cudagraph_runtime_mode=CUDAGraphMode[graph_mode],
+                batch_descriptor=BatchDescriptor(num_tokens=rows),
+            ):
+                output = model(inputs[rows])
+            torch.testing.assert_close(
+                output,
+                torch.full((rows, 6144), expected, dtype=torch.bfloat16, device="cuda"),
+            )

@@ -779,7 +779,7 @@ class CompilationConfig:
         "vllm::linear_attention",
         "vllm::qwen_gdn_attention_core",
         "vllm::qwen_gdn_attention_core_fused_norm_packed",
-        "vllm::qwen_gdn_attention_core_fused_norm_fp8_packed",
+        "vllm::qwen_gdn_attention_core_fused_norm_fp8_projected",
         "vllm::qwen_fa3_gate_quant",
         "vllm::gdn_attention_core_xpu",
         "vllm::olmo_hybrid_gdn_full_forward",

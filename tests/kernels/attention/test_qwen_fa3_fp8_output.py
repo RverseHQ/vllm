@@ -397,6 +397,12 @@ def test_q4_gate_quant_matches_bf16_rounding_and_projection(hopper, num_splits, 
     )
     projection = kernel.apply_prequantized_mm(quant, scale, weight, weight_scale)
     assert torch.equal(projection[:n], original_projection[:n])
+    provided = torch.empty_like(projection)
+    returned = kernel.apply_prequantized_mm(
+        quant, scale, weight, weight_scale, output=provided
+    )
+    assert returned is provided
+    assert torch.equal(provided[:n], original_projection[:n])
 
 
 @pytest.mark.parametrize(
