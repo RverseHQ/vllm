@@ -401,17 +401,33 @@ def test_q4_gate_quant_matches_bf16_rounding_and_projection(hopper, num_splits, 
 
 @pytest.mark.parametrize(
     "rows,enabled,raw_input",
-    [(31, True, False), (32, False, False), (32, True, False), (32, True, True)],
+    [
+        (31, True, False),
+        (32, False, False),
+        (32, True, False),
+        (32, True, True),
+        (193, True, False),
+        (16384, True, False),
+    ],
 )
 def test_qwen_preserves_bf16_projection_routes(monkeypatch, rows, enabled, raw_input):
-    """Keep eager rounding, small batches and raw-activation wrapper contributions."""
+    """Keep eager, non-decode and raw-activation projection routes unchanged."""
     import torch
 
     from vllm.model_executor.models import qwen3_next as model
 
     monkeypatch.setattr(model.envs, "VLLM_QWEN_FA3_FP8_OUTPUT", enabled)
     monkeypatch.setattr(model.envs, "VLLM_BATCH_INVARIANT", False)
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: raw_input)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: raw_input or rows > 192)
+    monkeypatch.setattr(
+        model,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                mode=model.CompilationMode.VLLM_COMPILE, backend="inductor"
+            )
+        ),
+    )
     monkeypatch.setattr(
         model,
         "qwen_attention_fp8_output",
@@ -449,6 +465,7 @@ def test_qwen_preserves_bf16_projection_routes(monkeypatch, rows, enabled, raw_i
     torch.nn.Module.__init__(attention)
     attention.use_fused_qk_norm_rope_gate = False
     attention._fp8_output_device_supported = True
+    attention._max_q4_decode_tokens = 192
     attention.num_heads, attention.head_dim = 24, 256
     attention.qkv_proj, attention.attn, attention.o_proj = (
         QKV(),

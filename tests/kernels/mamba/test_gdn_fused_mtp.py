@@ -122,6 +122,8 @@ def _build_layer(
         gdn_decode_kernel="cuda",
         use_gdn_recovery=False,
         _fp8_output_device_supported=current_platform.has_device_capability(90),
+        _max_spec_decode_tokens=vllm_config.scheduler_config.max_num_seqs
+        * (NUM_SPEC + 1),
         num_spec=NUM_SPEC,
     )
     with set_current_vllm_config(vllm_config):
@@ -416,12 +418,13 @@ def test_native_fp8_output_matches_official_quantizer(
 
 
 @pytest.mark.parametrize(
-    "rows,expected", [(4, False), (31, False), (32, True), (192, True)]
+    "rows,expected",
+    [(4, False), (31, False), (32, True), (192, True), (193, False), (16384, False)],
 )
 def test_gdn_fp8_output_compiles_existing_batch_routes(
     rows: int, expected: bool
 ) -> None:
-    """Dynamo must trace the existing batch cutoff without querying NVML."""
+    """Compile decode routes without moving prefill quantization into the core."""
     if not hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp_fp8"):
         pytest.skip("fused GDN FP8 output op is not built")
     kernel_type = qwen_gdn_linear_attn.FlashInferFp8DeepGEMMDynamicBlockScaledKernel
@@ -433,6 +436,7 @@ def test_gdn_fp8_output_compiles_existing_batch_routes(
     layer = types.SimpleNamespace(
         tp_size=1,
         _fp8_output_device_supported=True,
+        _max_spec_decode_tokens=192,
         out_proj=types.SimpleNamespace(quant_method=method, bias=None),
     )
     with patch.object(qwen_gdn_linear_attn.envs, "VLLM_BATCH_INVARIANT", False):

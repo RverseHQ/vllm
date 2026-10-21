@@ -591,6 +591,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.gqa_interleaved_layout = gqa_interleaved_layout
         self.qkvz_layout = "interleaved" if gqa_interleaved_layout else "flat"
         self._fp8_output_device_supported = current_platform.has_device_capability(90)
+        self._max_spec_decode_tokens = vllm_config.scheduler_config.max_num_seqs * (
+            self.num_spec + 1
+        )
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_cpu():
@@ -1302,6 +1305,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         method = self.out_proj.quant_method
         if (
             self.tp_size != 1
+            or num_tokens > self._max_spec_decode_tokens
             or self.out_proj.bias is not None
             or not self._fp8_output_device_supported
             or not isinstance(method, Fp8LinearMethod)

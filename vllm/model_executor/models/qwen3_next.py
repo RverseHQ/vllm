@@ -429,6 +429,9 @@ class Qwen3NextAttention(nn.Module):
         )
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
         self._fp8_output_device_supported = current_platform.is_device_capability(90)
+        self._max_q4_decode_tokens = (
+            get_current_vllm_config().scheduler_config.max_num_seqs * 4
+        )
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -624,6 +627,7 @@ class Qwen3NextAttention(nn.Module):
         if (
             envs.VLLM_QWEN_FA3_FP8_OUTPUT
             and torch.compiler.is_compiling()
+            and q.shape[0] <= self._max_q4_decode_tokens
             and not getattr(self.o_proj, "requires_unquantized_input", False)
         ):
             compilation = get_current_vllm_config().compilation_config
