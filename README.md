@@ -35,3 +35,44 @@ KV 总容量是按 262K 上下文口径估计的混合 KV/SSM 池容量，不是
 | 视觉临时内存 | 视觉 MLP 分块、packed rotary、独占 GELU/residual 缓冲区复用，以及最后使用后释放中间张量。 |
 | 编译与显存预算 | 在 cached AOT 的 piecewise 执行路径释放最后使用的输入；完整测量 FULL CUDA Graph 显存而非抽样外推；在适用的单 worker 配置启用 expandable segments。 |
 | 长上下文 FA3 | 保持原 FP8 格式、split 策略和两级 FP32 PV 累加，使用真正的 MTP Q4 M64/N128 内核；其他形状及 BF16 保留 SDK 路径。独立库仍需单独构建并显式加载。 |
+
+## 输出融合与变长验证实验
+
+以下路径默认关闭，不计入上表收益；H800 整模型数值、吞吐和 KV 容量均为 **Not tested**。
+
+| 开关 | 作用与范围 |
+| --- | --- |
+| `VLLM_QWEN_GDN_FP8_OUTPUT=1` | 将原生 GDN 递推、门控归一化的最终输出直接量化，供既有 DeepGEMM 投影使用；仅 TP1、纯 speculative decode、FP32 state、group128/E8M0。 |
+| `VLLM_QWEN_FA3_FP8_OUTPUT=1` | 在既有 Q4 split final-combine 中融合输出门控与量化；仅本仓 page1600 布局、`VLLM_COMPILE`/Inductor 编译路径。eager 保留原 sigmoid 舍入语义。 |
+| `VLLM_QWEN_GDN_DEVICE_METADATA=1` | 将纯解码的状态槽、设备查询边界和 padding 元数据合并为一次设备端准备；可独立用于固定 MTP3 对照。 |
+
+需重新编译本 fork 的原生扩展。小 batch 的 FlashInfer BF16 输入路由不变；LoRA 等声明需要原始激活的投影包装层、mixed/prefill 和不适用配置保留原路径。
+
+FA3 实验还需构建独立库。按源码 manifest 固定 `FA3_SOURCE_DIR`、`CUTLASS_SOURCE_DIR`，选择持久的 `FA3_GATE_BUILD_DIR`；原有 `QWEN_MAIN237_FA3_LIBRARY` 和 `QWEN_MAIN237_FA3_Q4_LIBRARY` 保持原设置：
+
+```bash
+python tools/flash_attn_fp8/build_fp8_q4.py \
+  --source-dir "$FA3_SOURCE_DIR" --cutlass-dir "$CUTLASS_SOURCE_DIR" \
+  --gate-quant --output-dir "$FA3_GATE_BUILD_DIR"
+export QWEN_MAIN237_FA3_Q4_GATE_QUANT_LIBRARY="$FA3_GATE_BUILD_DIR/build/_qwen_q4_gate_quant_C.so"
+```
+
+缺少对应原生算子/库、split 为 0/1 或形状不适用时，不会命中原生输出融合。不能把实验开关开启等同于融合已执行。
+
+自适应验证复用现有在线接受率估计器，无需新置信度头；在原 MTP 配置中加入：
+
+```json
+{
+  "method": "mtp",
+  "num_speculative_tokens": 3,
+  "rejection_sample_method": "standard",
+  "enable_adaptive_verification": true,
+  "use_local_argmax_reduction": false
+}
+```
+
+这会自动启用 GDN 设备元数据路径，最大验证窗口仍为 4（主 token 加 3 个草稿）。混合 prefill 保留原处理，但不再信任 CPU 均分产生的逐请求 uniform 长度提示。
+
+本机 SM89 已执行生产 GDN CUDA 源码与旧 SDK 的 17 组逐字节对照（含变长及 padding）、FA3 生产门控量化 helper、量化回退和元数据图重放；两条生产 CUDA 路径已通过 SM90 离线构建。完整 attention 与 DeepGEMM 消费者数值仍需 H800 验收。
+
+开启现有 `VLLM_CUSTOM_SCOPES_FOR_PROFILING=1` 并导出 Torch profiler trace 后，可查看 `mrv2:prepare_attn` 和 `mrv2:forward:FULL`/`PIECEWISE`/`NONE`/`UBATCH`，区分主模型图外准备与实际图分派；未开启 profiling scopes 时这些标记为空上下文。
