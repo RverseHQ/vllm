@@ -35,3 +35,11 @@ KV 总容量是按 262K 上下文口径估计的混合 KV/SSM 池容量，不是
 | 视觉临时内存 | 视觉 MLP 分块、packed rotary、独占 GELU/residual 缓冲区复用，以及最后使用后释放中间张量。 |
 | 编译与显存预算 | 在 cached AOT 的 piecewise 执行路径释放最后使用的输入；完整测量 FULL CUDA Graph 显存而非抽样外推；在适用的单 worker 配置启用 expandable segments。 |
 | 长上下文 FA3 | 保持原 FP8 格式、split 策略和两级 FP32 PV 累加，使用真正的 MTP Q4 M64/N128 内核；其他形状及 BF16 保留 SDK 路径。独立库仍需单独构建并显式加载。 |
+
+## 后续保留改动
+
+- **GDN eager 恢复容量**：恢复元数据同时覆盖真实请求数和 CUDA Graph 补齐容量，避免关闭 CUDA Graph 时分配零容量。
+- **GDN replay 写入**：卷积结果直接写入既有恢复缓冲，并用一个 kernel 保存两组 gate；保持原始 BF16 输入和 FP32 恢复状态。已确认局部链路改善，但没有稳定的整模吞吐收益。
+- **AV 显存计账**：先测量 CUDA Graph 占用，再执行自适应验证校准；临时 profiling 不运行校准。修正校准缓存挤占 KV 预算的问题，不代表 AV 优于固定 MTP3。
+
+未取得稳定整模收益的 GDN/FA3 输出融合、GPU 元数据等实验及其支撑改动保留在 [实验归档分支](https://github.com/RverseHQ/vllm/tree/archive/qwen38-h800-experiments-20261024)，不再进入当前交付分支。

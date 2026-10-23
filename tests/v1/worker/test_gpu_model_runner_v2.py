@@ -343,6 +343,53 @@ def test_capture_model_profile_only_skips_lock(monkeypatch):
     assert lock_calls == []
 
 
+@pytest.mark.parametrize("profile_only", [False, True])
+def test_adaptive_calibration_is_not_reserved_as_cudagraph_memory(
+    monkeypatch, profile_only
+):
+    runner = _make_capture_runner(captured=True)
+    free_bytes = [1024 << 20]
+    events = []
+
+    def capture(*args, **kwargs):
+        free_bytes[0] -= 64 << 20
+
+    def profile_cost(**kwargs):
+        assert "lock" not in events
+        free_bytes[0] -= 128 << 20
+        events.append("profile")
+
+    runner.cudagraph_manager.capture = capture
+    runner.cudagraph_manager.captured_token_counts = lambda: [8]
+    runner._dummy_run = profile_cost
+    runner.step_timing = SimpleNamespace(collect=lambda: contextlib.nullcontext([]))
+    runner.adaptive_verification = SimpleNamespace(
+        batches_to_profile=lambda sizes: iter([{"num_tokens": sizes[0]}]),
+        set_initial_cost_curves=lambda samples: events.append("calibrated"),
+    )
+    runner.kv_connector = SimpleNamespace(
+        reset_capture_state=lambda: events.append("reset")
+    )
+    monkeypatch.setattr(
+        model_runner_module, "freeze_gc_for_cudagraph_capture", contextlib.nullcontext
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda: (free_bytes[0], 1024 << 20)
+    )
+    monkeypatch.setattr(
+        model_runner_module, "lock_workspace", lambda: events.append("lock")
+    )
+
+    graph_bytes = runner.capture_model(profile_only=profile_only)
+
+    assert graph_bytes == 64 << 20
+    assert events == (
+        ["reset"] if profile_only else ["profile", "calibrated", "reset", "lock"]
+    )
+
+
 @pytest.mark.parametrize("target_buffer", ["absent", "none", "tensor"])
 def test_get_drafter_hidden_states_tolerates_missing_target_buffer(target_buffer):
     """Targets allocate the MTP hidden buffer only for hidden-state drafters."""
