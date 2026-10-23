@@ -19,6 +19,27 @@ from vllm.model_executor.layers.mamba.ops.gdn_recover_native import load_native_
 from vllm.triton_utils import tl, triton
 
 
+@triton.jit
+def _save_gdn_replay_gates_kernel(
+    a,
+    b,
+    saved_a,
+    saved_b,
+    count,
+    HEADS: tl.constexpr,
+    A_ROW_STRIDE: tl.constexpr,
+    B_ROW_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row, head = offsets // HEADS, offsets % HEADS
+    live = offsets < count
+    a_value = tl.load(a + row * A_ROW_STRIDE + head, live, other=0)
+    b_value = tl.load(b + row * B_ROW_STRIDE + head, live, other=0)
+    tl.store(saved_a + offsets, a_value, live)
+    tl.store(saved_b + offsets, b_value, live)
+
+
 @dataclass
 class GdnRecoverPayload:
     """Fixed, pre-profile storage in this step's packed spec-token order."""
@@ -26,6 +47,22 @@ class GdnRecoverPayload:
     mixed_qkv: torch.Tensor
     a: torch.Tensor
     b: torch.Tensor
+
+    def save_gates(self, a: torch.Tensor, b: torch.Tensor) -> None:
+        count = a.numel()
+        block = 256
+        _save_gdn_replay_gates_kernel[(triton.cdiv(count, block),)](
+            a,
+            b,
+            self.a,
+            self.b,
+            count,
+            HEADS=a.shape[1],
+            A_ROW_STRIDE=a.stride(0),
+            B_ROW_STRIDE=b.stride(0),
+            BLOCK=block,
+            num_warps=4,
+        )
 
     @property
     def nbytes(self) -> int:

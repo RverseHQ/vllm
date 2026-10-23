@@ -120,6 +120,7 @@ def _build_layer(
         norm=_TestGatedNorm(norm_weight, output_gate_activation),
         layer_norm_epsilon=EPS,
         gdn_decode_kernel="cuda",
+        use_gdn_recovery=False,
     )
     with set_current_vllm_config(vllm_config):
         layer.chunk_gated_delta_rule = ChunkGatedDeltaRule()
@@ -140,6 +141,34 @@ def _build_layer(
             types.MethodType(getattr(QwenGatedDeltaNetAttention, name), layer),
         )
     return layer
+
+
+@pytest.mark.parametrize("rows", [32, 192])
+def test_recovery_payload_preserves_strided_gates_on_graph_replay(rows: int) -> None:
+    from vllm.model_executor.layers.mamba.ops.gdn_recover import GdnRecoverPayload
+
+    torch.manual_seed(7)
+    packed = torch.randn(rows, 96, device="cuda", dtype=torch.bfloat16)
+    b, a = packed.chunk(2, dim=-1)
+    payload = GdnRecoverPayload(
+        torch.empty(192, 10240, device="cuda", dtype=torch.bfloat16),
+        torch.full((192, 48), 93, device="cuda", dtype=torch.bfloat16),
+        torch.full((192, 48), 93, device="cuda", dtype=torch.bfloat16),
+    )
+    payload.save_gates(a, b)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        payload.save_gates(a, b)
+    for _ in range(2):
+        packed.neg_()
+        payload.a.fill_(93)
+        payload.b.fill_(93)
+        expected_a, expected_b = payload.a.clone(), payload.b.clone()
+        expected_a[:rows].copy_(a)
+        expected_b[:rows].copy_(b)
+        graph.replay()
+        assert torch.equal(payload.a.view(torch.int16), expected_a.view(torch.int16))
+        assert torch.equal(payload.b.view(torch.int16), expected_b.view(torch.int16))
 
 
 @pytest.mark.parametrize(
@@ -163,6 +192,7 @@ def test_fused_mtp_head_ratio_guard(num_v_heads: int, expected: bool) -> None:
         num_v_heads=num_v_heads,
         kv_cache=(None, torch.empty(1, dtype=torch.float32, device="cuda")),
         gdn_decode_kernel="cuda",
+        use_gdn_recovery=False,
     )
     attn_metadata = types.SimpleNamespace(
         spec_state_indices_tensor=torch.ones(
