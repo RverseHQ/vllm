@@ -118,7 +118,7 @@ class GDNRecoverAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self.recovery_batch = self.layers[0].gdn_recovery_storage.group(layer_names)
         for index, layer in enumerate(self.layers):
             layer.gdn_recovery_binding = (weakref.ref(self.recovery_batch), index)
-        n = self.decode_cudagraph_max_bs
+        n = max(self.decode_cudagraph_max_bs, vllm_config.scheduler_config.max_num_seqs)
         self.verify_indices = torch.zeros(
             (n, self.num_spec + 2), dtype=torch.int32, device=device
         )
