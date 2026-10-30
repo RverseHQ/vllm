@@ -143,6 +143,43 @@ def _build_layer(
     return layer
 
 
+def test_native_recovery_compaction_on_current_device() -> None:
+    from vllm.model_executor.layers.mamba.ops.gdn_recover import (
+        GdnRecoverBatchStorage,
+        allocate_payload,
+    )
+
+    device = torch.device("cuda")
+    payload = allocate_payload(
+        rows=1,
+        max_tokens=4,
+        num_key_heads=16,
+        num_value_heads=48,
+        device=device,
+    )
+    batch = GdnRecoverBatchStorage(device).group([PREFIX])
+    conv = torch.randn(3, 10240, 6, dtype=torch.bfloat16, device=device)
+    state = torch.zeros(3, 48, 128, 128, dtype=torch.float32, device=device)
+    a_log = torch.zeros(48, dtype=torch.float32, device=device)
+    dt_bias = torch.zeros_like(a_log)
+    expected = conv.clone()
+    expected[0, :, :3].copy_(conv[1, :, :3])
+    expected[2, :, :3].copy_(conv[1, :, 2:5])
+    batch.bind_layer(
+        0,
+        payload=payload,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        state=state,
+        conv=conv,
+        history=3,
+    )
+    batch.compact_conv(
+        torch.tensor([[1, 0, 1, 2, 3]], device=device, dtype=torch.int32)
+    )
+    assert torch.equal(conv.view(torch.int16), expected.view(torch.int16))
+
+
 @pytest.mark.parametrize("rows", [32, 192])
 def test_recovery_payload_preserves_strided_gates_on_graph_replay(rows: int) -> None:
     from vllm.model_executor.layers.mamba.ops.gdn_recover import GdnRecoverPayload
